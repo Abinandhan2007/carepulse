@@ -1,0 +1,300 @@
+// src/types/staff.ts
+
+export type StaffRole = 'superadmin' | 'admin' | 'receptionist' | 'doctor' | 'nurse';
+
+export interface Staff {
+  id: string;
+  staff_id?: string;
+  staff_code?: string;
+  staffCode?: string;
+  name?: string;
+  fullName?: string;
+  email: string;
+  username?: string;
+  role: StaffRole;
+  isActive?: boolean;
+  department?: string;
+  avatarUrl?: string;
+  avatar?: string;
+  hospital_id?: string;
+  hospitalId?: string;
+  hospitalName?: string;
+  hospital_name?: string;
+  doctorId?: string;
+  doctor_id?: string;
+  phone?: string;
+  deskName?: string;
+  desk_name?: string;
+}
+
+export interface AdminProfile {
+  id: string;
+  staff_code?: string;
+  staffCode?: string;
+  name: string;
+  email: string;
+  username?: string;
+  password?: string;
+  phone: string;
+  role: 'admin';
+  department: string;
+  avatarUrl?: string;
+  hospitalName?: string;
+  hospitalId?: string;
+  hospital_id?: string;
+}
+
+export interface ReceptionistRecord {
+  id: string;
+  staff_code?: string;
+  staffCode?: string;
+  name: string;
+  email: string;
+  username?: string;
+  staffId?: string;
+  phone: string;
+  password?: string;
+  hospitalName?: string;
+  hospitalId?: string;
+  hospital_id?: string;
+  department: string;
+  deskNumber: string;
+  shift: 'Morning' | 'Evening' | 'Night' | 'Full Day';
+  isActive: boolean;
+  avatarUrl: string;
+  assignedDoctorsCount?: number;
+  joinDate: string;
+}
+
+export interface NurseRecord {
+  id: string;
+  staff_code?: string;
+  staffCode?: string;
+  name: string;
+  fullName?: string;
+  email: string;
+  username?: string;
+  phone: string;
+  password?: string;
+  hospitalName?: string;
+  hospitalId?: string;
+  hospital_id?: string;
+  department: string;
+  shift?: 'Morning' | 'Evening' | 'Night' | 'Rotational' | string;
+  role: 'nurse';
+  isActive: boolean;
+  avatarUrl?: string;
+  photo?: string;
+  joinDate?: string;
+  created_at?: string;
+}
+
+export interface HospitalSettings {
+  name: string;
+  tagline: string;
+  address: string;
+  phone: string;
+  emergencyHotline: string;
+  email: string;
+  logoUrl?: string;
+  defaultSlotDurationMinutes: number;
+  maxOnlineBookingPercentage: number;
+  enableAiTriage: boolean;
+  enableSmsReminders: boolean;
+  enableAutoCancellation: boolean;
+}
+
+export interface HospitalBranch {
+  id: string;
+  hospital_code?: string;
+  hospitalCode?: string;
+  name: string;
+  address: string;
+  city: string;
+  phone: string;
+  operatingHours: string;
+  doctorsCount: number;
+  receptionDesksCount: number;
+  logoUrl: string;
+  isActive: boolean;
+  latitude?: number;
+  longitude?: number;
+}
+
+export interface DepartmentRecord {
+  id: string;
+  name: string;
+  iconName: string;
+  color: string;
+  headDoctor: string;
+  operatingHours: string;
+  description: string;
+  doctorIds: string[];
+  totalBeds?: number;
+  emergencyCoverage?: boolean;
+}
+
+export interface AnnouncementRecord {
+  id: string;
+  hospitalId?: string;
+  title: string;
+  message: string;
+  audience: 'All Patients' | 'All Staff' | 'Clinical Staff' | 'Front Desk Reception' | 'Nursing Staff';
+  department?: string;
+  priority: 'Normal' | 'High' | 'Urgent';
+  isActive?: boolean;
+  postedAt?: string;
+  authorName?: string;
+  authorRole?: string;
+  status?: 'Sent' | 'Scheduled' | 'Draft' | string;
+  scheduledFor?: string;
+  sentAt?: string;
+  deliveredCount?: number;
+  readCount?: number;
+}
+
+export interface StaffMessage {
+  id: string;
+  hospitalId?: string;
+  senderId: string;
+  senderName: string;
+  senderRole: StaffRole;
+  senderCode?: string;
+  recipientRole?: StaffRole | 'all';
+  recipientId?: string;
+  subject: string;
+  message: string;
+  priority: 'normal' | 'high' | 'urgent';
+  isRead: boolean;
+  parentId?: string;
+  createdAt: string;
+  replies?: StaffMessage[];
+}
+
+export type SuperAdminHospitalLifecycle = 'Draft' | 'Pending Setup' | 'Active' | 'Suspended';
+
+export interface SuperAdminStats {
+  total_hospitals: number;
+  active_hospitals: number;
+  total_admins: number;
+  hospitals_with_admin: number;
+  hospitals_without_admin: number;
+  total_doctors: number;
+  total_receptionists: number;
+  total_patients: number;
+  lifecycle_breakdown?: {
+    active: number;
+    pending_setup: number;
+    draft: number;
+    suspended: number;
+  };
+}
+
+export interface SuperAdminHospital {
+  id: string;
+  hospital_code: string;
+  name: string;
+  address: string;
+  phone?: string;
+  email?: string;
+  facility_type?: string;
+  rating?: number;
+  reviews_count?: number;
+  emergency_available?: boolean;
+  image_url?: string;
+  specialties?: string[];
+  is_active: boolean;
+  is_suspended?: boolean;
+  lifecycle_state?: SuperAdminHospitalLifecycle;
+  suspension_reason?: string | null;
+  suspended_at?: string | null;
+  created_at?: string;
+  has_active_admin: boolean;
+  doctor_count: number;
+  receptionist_count: number;
+  latitude?: number;
+  longitude?: number;
+  admin?: {
+    id: string;
+    full_name: string;
+    email: string;
+    staff_code: string;
+    phone?: string;
+    is_active: boolean;
+    created_at?: string;
+  } | null;
+}
+
+export interface SuperAdminAdmin {
+  id: string;
+  staff_code: string;
+  full_name: string;
+  email: string;
+  phone?: string;
+  role: 'admin';
+  department: string;
+  is_active: boolean;
+  hospital_id: string;
+  hospital_name: string;
+  hospital_code: string;
+  created_at?: string;
+}
+
+export interface SuperAdminAuditEvent {
+  id: string;
+  timestamp: string;
+  actor_code: string;
+  actor_name: string;
+  action_type:
+    | 'HOSPITAL_CREATED'
+    | 'HOSPITAL_DELETED'
+    | 'HOSPITAL_LIFECYCLE_CHANGED'
+    | 'ADMIN_APPOINTED'
+    | 'ADMIN_ACTIVATED'
+    | 'ADMIN_DEACTIVATED'
+    | 'ADMIN_DELETED'
+    | string;
+  target_type: 'hospital' | 'admin';
+  target_id: string;
+  target_code: string;
+  target_name: string;
+  description: string;
+  before_state?: Record<string, any> | null;
+  after_state?: Record<string, any> | null;
+  reason?: string | null;
+}
+
+export interface SuperAdminAppDevice {
+  id: string;
+  patient_id?: string;
+  patient_name: string;
+  patient_phone: string;
+  patient_email: string;
+  patient_code: string;
+  patient_avatar?: string;
+  device_id: string;
+  device_model: string;
+  manufacturer: string;
+  platform: 'android' | 'ios' | 'web';
+  os_version: string;
+  app_version: string;
+  latest_version?: string;
+  is_up_to_date?: boolean;
+  ip_address: string;
+  has_fcm: boolean;
+  is_active: boolean;
+  last_login: string | null;
+  created_at: string | null;
+}
+
+export interface SuperAdminAppDeviceStats {
+  total_devices: number;
+  android_count: number;
+  ios_count: number;
+  web_count: number;
+  active_24h: number;
+  latest_version?: string;
+  updated_devices_count?: number;
+  outdated_devices_count?: number;
+}
+

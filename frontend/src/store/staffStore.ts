@@ -1,0 +1,1457 @@
+// src/store/staffStore.ts
+import { create } from 'zustand';
+import type {
+  Staff,
+  AdminProfile,
+  ReceptionistRecord,
+  NurseRecord,
+  HospitalSettings,
+  HospitalBranch,
+  DepartmentRecord,
+  AnnouncementRecord,
+  StaffMessage,
+} from '../types/staff';
+import type { DoctorRecord, TokenQueueItem, TokenStatus, ReceptionistProfile, TimeSlotCapacity } from '../types/receptionist';
+import { receptionistService } from '../services/receptionistService';
+import { apiGet, apiPost, apiFetch } from '../lib/apiFetch';
+import { playChatNotificationSound, playUrgentAlertSound } from '../lib/soundUtils';
+
+export function createSplitSlot(
+  id: string,
+  timeSlot: string,
+  maxSeats: number,
+  onlineBooked = 0,
+  offlineBooked = 0,
+  isAvailable = true
+): TimeSlotCapacity {
+  const onlineMaxSeats = Math.ceil(maxSeats / 2);
+  const offlineMaxSeats = Math.floor(maxSeats / 2);
+  const onlineAvailableSeats = Math.max(0, onlineMaxSeats - onlineBooked);
+  const offlineAvailableSeats = Math.max(0, offlineMaxSeats - offlineBooked);
+
+  return {
+    id,
+    timeSlot,
+    maxSeats,
+    bookedSeats: onlineBooked + offlineBooked,
+    availableSeats: onlineAvailableSeats + offlineAvailableSeats,
+    onlineMaxSeats,
+    onlineBookedSeats: onlineBooked,
+    onlineAvailableSeats,
+    offlineMaxSeats,
+    offlineBookedSeats: offlineBooked,
+    offlineAvailableSeats,
+    isAvailable,
+  };
+}
+
+export const DEFAULT_SLOTS: TimeSlotCapacity[] = [];
+
+const INITIAL_DOCTORS: DoctorRecord[] = [];
+
+const INITIAL_TOKENS: TokenQueueItem[] = [];
+
+const getStoredStaff = (): Staff | null => {
+  try {
+    const raw = localStorage.getItem('carepulse_staff') || sessionStorage.getItem('carepulse_staff');
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
+
+export const getInitialReceptionistProfile = (): ReceptionistProfile => {
+  const storedStaff = getStoredStaff();
+  if (storedStaff && storedStaff.role === 'receptionist') {
+    const hospName = storedStaff.hospitalName || storedStaff.hospital_name || 'BAG Hospital';
+    const empId = storedStaff.staffCode || storedStaff.staff_code || '';
+    const emailPrefix = storedStaff.email ? storedStaff.email.split('@')[0] : 'receptionist';
+    return {
+      id: storedStaff.id,
+      name: storedStaff.name || 'Reception Desk',
+      fullName: storedStaff.name || 'Reception Desk',
+      username: storedStaff.username || emailPrefix,
+      email: storedStaff.email || '',
+      phone: storedStaff.phone || '',
+      employeeId: empId,
+      staffCode: empId,
+      clinicName: hospName,
+      hospitalName: hospName,
+      hospitalId: storedStaff.hospitalId || 'hosp-bag',
+      deskName: storedStaff.deskName || 'Main Reception & OPD Desk',
+      department: storedStaff.department || 'Front Desk & Patient Triage',
+      shift: 'Morning Shift (08:00 AM - 04:00 PM)',
+      avatarUrl: storedStaff.avatarUrl || storedStaff.avatar || '',
+      operationalStatus: 'Active On Duty',
+      twoFactorEnabled: true,
+      isActive: true,
+    };
+  }
+  return {
+    id: '',
+    name: 'Reception Desk',
+    fullName: 'Reception Desk',
+    username: 'receptionist',
+    email: '',
+    phone: '',
+    employeeId: '',
+    staffCode: '',
+    clinicName: 'BAG Hospital',
+    hospitalName: 'BAG Hospital',
+    hospitalId: 'hosp-bag',
+    deskName: 'Main Reception & OPD Desk',
+    department: 'Front Desk & Patient Triage',
+    shift: 'Morning Shift (08:00 AM - 04:00 PM)',
+    avatarUrl: '',
+    operationalStatus: 'Active On Duty',
+    twoFactorEnabled: true,
+    isActive: true,
+  };
+};
+
+const DEFAULT_ADMIN_PROFILE: AdminProfile = {
+  id: '',
+  name: 'Hospital Administrator',
+  email: '',
+  username: 'admin',
+  password: '',
+  phone: '',
+  role: 'admin',
+  department: 'Hospital Administration & Operations',
+  avatarUrl: '',
+  hospitalName: 'CarePulse Medical Center',
+  hospitalId: '',
+};
+
+export const getInitialAdminProfile = (): AdminProfile => {
+  const storedStaff = getStoredStaff();
+  if (storedStaff && storedStaff.role === 'admin') {
+    const hospName = storedStaff.hospitalName || storedStaff.hospital_name || 'CarePulse Medical Center';
+    return {
+      id: storedStaff.id,
+      name: storedStaff.name || 'Hospital Administrator',
+      email: storedStaff.email || '',
+      username: storedStaff.username || (storedStaff.email ? storedStaff.email.split('@')[0] : 'admin'),
+      password: '',
+      phone: storedStaff.phone || '',
+      role: 'admin',
+      department: storedStaff.department || 'Chief Hospital Administration',
+      avatarUrl: storedStaff.avatarUrl || '',
+      hospitalName: hospName,
+      hospitalId: storedStaff.hospitalId || undefined,
+    };
+  }
+  return DEFAULT_ADMIN_PROFILE;
+};
+
+const DEFAULT_HOSPITAL_SETTINGS: HospitalSettings = {
+  name: 'CarePulse Medical Center',
+  tagline: 'Advanced Clinical Care & Patient Guidance Center',
+  address: 'Healthcare Complex, Medical District',
+  phone: '+91 1800 123 4567',
+  emergencyHotline: '+91 1800 123 4567',
+  email: 'admin@carepulse.health',
+  logoUrl: '/hospital_default.jpg',
+  defaultSlotDurationMinutes: 30,
+  maxOnlineBookingPercentage: 50,
+  enableAiTriage: true,
+  enableSmsReminders: true,
+  enableAutoCancellation: false,
+};
+
+export const getInitialHospitalSettings = (): HospitalSettings => {
+  const storedStaff = getStoredStaff();
+  const hospName = storedStaff?.hospitalName || storedStaff?.hospital_name || 'CarePulse Medical Center';
+  return {
+    ...DEFAULT_HOSPITAL_SETTINGS,
+    name: hospName,
+  };
+};
+
+const DEFAULT_RECEPTIONISTS: ReceptionistRecord[] = [];
+
+const DEFAULT_HOSPITALS: HospitalBranch[] = [];
+
+const DEFAULT_DEPARTMENTS: DepartmentRecord[] = [];
+
+const DEFAULT_ANNOUNCEMENTS: AnnouncementRecord[] = [];
+
+export interface StaffState {
+  currentStaff: Staff | null;
+  receptionistProfile: ReceptionistProfile;
+  adminProfile: AdminProfile;
+  hospitalSettings: HospitalSettings;
+  receptionists: ReceptionistRecord[];
+  nurses: NurseRecord[];
+  hospitals: HospitalBranch[];
+  departments: DepartmentRecord[];
+  announcements: AnnouncementRecord[];
+  staffMessages: StaffMessage[];
+  unreadStaffMessagesCount: number;
+  doctors: DoctorRecord[];
+  tokens: TokenQueueItem[];
+  bookings: TokenQueueItem[];
+  isLoading: boolean;
+  error: string | null;
+
+  // Auth Actions
+  setStaffAuth: (staff: Staff, token?: string) => void;
+  logoutStaff: () => void;
+
+  // Department Actions
+  addDepartment: (deptData: Partial<DepartmentRecord>) => Promise<void>;
+  updateDepartment: (id: string, updates: Partial<DepartmentRecord>) => Promise<void>;
+  deleteDepartment: (id: string) => Promise<void>;
+
+  // Announcement Actions
+  fetchAnnouncements: (silent?: boolean) => Promise<void>;
+  addAnnouncement: (annData: Partial<AnnouncementRecord>) => Promise<void>;
+  deleteAnnouncement: (id: string) => Promise<void>;
+
+  // Staff Communication & Messages Actions
+  fetchStaffMessages: (silent?: boolean) => Promise<void>;
+  sendStaffMessage: (msgData: Partial<StaffMessage>) => Promise<void>;
+  markStaffMessageRead: (id: string) => Promise<void>;
+  deleteStaffMessage: (id: string) => Promise<void>;
+
+  // Hospital Branch Actions
+  addHospital: (hospData: Partial<HospitalBranch>) => Promise<void>;
+  updateHospital: (id: string, updates: Partial<HospitalBranch>) => Promise<void>;
+  deleteHospital: (id: string) => Promise<void>;
+
+  // Receptionist Actions
+  fetchReceptionistProfile: () => Promise<void>;
+  updateReceptionistProfile: (profile: Partial<ReceptionistProfile>) => Promise<void>;
+
+  // Admin Receptionist Actions
+  fetchReceptionists: () => Promise<void>;
+  createReceptionist: (recData: Partial<ReceptionistRecord>) => Promise<void>;
+  updateReceptionist: (id: string, updates: Partial<ReceptionistRecord>) => Promise<void>;
+  deleteReceptionist: (id: string) => Promise<void>;
+  toggleReceptionistStatus: (id: string) => Promise<void>;
+
+  // Admin Nurse Actions
+  fetchNurses: () => Promise<void>;
+  createNurse: (nurseData: Partial<NurseRecord>) => Promise<NurseRecord | null>;
+  updateNurse: (id: string, updates: Partial<NurseRecord>) => Promise<void>;
+  deleteNurse: (id: string) => Promise<void>;
+  toggleNurseStatus: (id: string) => Promise<void>;
+  updateHospitalSettings: (settings: Partial<HospitalSettings>) => Promise<void>;
+  updateAdminProfile: (profile: Partial<AdminProfile>) => Promise<void>;
+  globalSlotOverride: (doctorId: string, slotId: string, maxSeats: number, isAvailable?: boolean) => Promise<void>;
+  updateDoctor: (id: string, updates: Partial<DoctorRecord>) => Promise<void>;
+  deleteDoctor: (id: string) => Promise<void>;
+
+  // Doctor & Token Actions
+  fetchDoctors: (silent?: boolean) => Promise<void>;
+  toggleDoctorAvailability: (doctorId: string, isAvailable?: boolean, reason?: string, unavailableUntil?: string) => Promise<void>;
+  updateDoctorSlotCapacity: (doctorId: string, timeSlot: string, availableSeats: number) => Promise<void>;
+  updateSlotCapacity: (doctorId: string, timeSlot: string, maxSeats: number, isAvailable?: boolean) => Promise<{ success: boolean; error?: string }>;
+  addTimeSlot: (doctorId: string, timeSlot: string, maxSeats: number) => Promise<{ success: boolean; error?: string }>;
+  removeTimeSlot: (doctorId: string, slotId: string) => Promise<{ success: boolean; error?: string }>;
+  addStandardSlots: (doctorId: string, maxSeats?: number, clearExisting?: boolean) => Promise<{ success: boolean; doctor?: any; error?: string }>;
+  createDoctor: (doctorData: Partial<DoctorRecord>) => Promise<void>;
+  fetchTokens: (doctorId?: string, silent?: boolean) => Promise<void>;
+  fetchBookings: (doctorId?: string, silent?: boolean) => Promise<void>;
+  checkInAppointment: (appointmentId: string) => Promise<boolean>;
+  callNextToken: (doctorId?: string) => Promise<void>;
+  updateTokenStatus: (
+    tokenId: string,
+    status: TokenStatus,
+    consultationData?: {
+      diagnosis?: string;
+      assessment?: string;
+      clinicalNotes?: string;
+      prescriptionDetails?: string;
+      prescriptions?: string[];
+      checkInTime?: string;
+    }
+  ) => Promise<void>;
+  bookWalkInAppointment: (appointmentData: {
+    patientName: string;
+    patientPhone: string;
+    doctorId: string;
+    doctorName: string;
+    doctorSpecialty: string;
+    date: string;
+    timeSlot: string;
+    age?: number;
+    bloodGroup?: string;
+    address?: string;
+    healthIssue?: string;
+    hospitalId?: string;
+    hospitalName?: string;
+  }) => Promise<TokenQueueItem | null>;
+}
+
+export const useStaffStore = create<StaffState>((set, get) => ({
+  currentStaff: getStoredStaff(),
+  receptionistProfile: getInitialReceptionistProfile(),
+  adminProfile: getInitialAdminProfile(),
+  hospitalSettings: getInitialHospitalSettings(),
+  receptionists: DEFAULT_RECEPTIONISTS,
+  nurses: [],
+  hospitals: DEFAULT_HOSPITALS,
+  departments: DEFAULT_DEPARTMENTS,
+  announcements: DEFAULT_ANNOUNCEMENTS,
+  staffMessages: [],
+  unreadStaffMessagesCount: 0,
+  doctors: INITIAL_DOCTORS,
+  tokens: INITIAL_TOKENS,
+  bookings: [],
+  isLoading: false,
+  error: null,
+
+  setStaffAuth: (staff, token) => {
+    if (token) {
+      localStorage.setItem('staff_token', token);
+      sessionStorage.setItem('active_staff_token', token);
+      if (staff?.role) {
+        localStorage.setItem(`${staff.role}_token`, token);
+        sessionStorage.setItem(`${staff.role}_token`, token);
+        sessionStorage.setItem('active_staff_role', staff.role);
+      }
+    }
+    if (staff) {
+      const hospId = staff.hospitalId || staff.hospital_id;
+      const hospName = staff.hospitalName || staff.hospital_name || 'CarePulse Medical Center';
+      const updatedStaff = {
+        ...staff,
+        hospitalId: hospId,
+        hospital_id: hospId,
+        hospitalName: hospName,
+        hospital_name: hospName,
+      };
+      localStorage.setItem('carepulse_staff', JSON.stringify(updatedStaff));
+      sessionStorage.setItem('carepulse_staff', JSON.stringify(updatedStaff));
+
+      set((state) => ({
+        hospitalSettings: {
+          ...state.hospitalSettings,
+          name: hospName,
+        },
+      }));
+
+      if (staff.role === 'receptionist') {
+        const emailPrefix = staff.email ? staff.email.split('@')[0] : 'receptionist';
+        const empId = staff.staff_code || staff.staffCode || staff.id || '';
+        set((state) => ({
+          receptionistProfile: {
+            ...state.receptionistProfile,
+            id: staff.id,
+            name: staff.name || state.receptionistProfile.name,
+            fullName: staff.name || state.receptionistProfile.fullName,
+            username: staff.username || emailPrefix,
+            email: staff.email,
+            phone: staff.phone || state.receptionistProfile.phone,
+            department: staff.department || state.receptionistProfile.department,
+            clinicName: hospName,
+            hospitalName: hospName,
+            hospitalId: hospId,
+            deskName: staff.deskName || state.receptionistProfile.deskName || 'Main Reception & OPD Desk',
+            employeeId: empId,
+            staffCode: empId,
+          },
+        }));
+      }
+
+      if (staff.role === 'admin') {
+        set((state) => ({
+          adminProfile: {
+            ...state.adminProfile,
+            id: staff.id,
+            name: staff.name || state.adminProfile.name,
+            email: staff.email,
+            hospitalId: hospId,
+            hospitalName: hospName,
+            department: staff.department || state.adminProfile.department,
+          },
+        }));
+      }
+
+      set({ currentStaff: updatedStaff });
+    } else {
+      set({ currentStaff: null });
+    }
+  },
+
+  logoutStaff: () => {
+    localStorage.removeItem('staff_token');
+    localStorage.removeItem('carepulse_staff');
+    sessionStorage.removeItem('active_staff_token');
+    sessionStorage.removeItem('active_staff_role');
+    sessionStorage.removeItem('carepulse_staff');
+    sessionStorage.removeItem('superadmin_token');
+    sessionStorage.removeItem('nurse_token');
+    sessionStorage.removeItem('doctor_token');
+    sessionStorage.removeItem('receptionist_token');
+    sessionStorage.removeItem('admin_token');
+    set({ currentStaff: null });
+  },
+
+  fetchReceptionistProfile: async () => {
+    try {
+      const realProfile = await receptionistService.getProfile();
+      if (realProfile) {
+        set({ receptionistProfile: realProfile });
+      }
+    } catch (e) {
+      console.warn('Failed to fetch real receptionist profile from API', e);
+    }
+  },
+
+  updateReceptionistProfile: async (updatedData) => {
+    set((state) => ({
+      receptionistProfile: { ...state.receptionistProfile, ...updatedData },
+    }));
+    try {
+      const saved = await receptionistService.updateProfile(updatedData);
+      if (saved) {
+        set({ receptionistProfile: saved });
+      }
+    } catch (e) {
+      console.warn('Failed to update receptionist profile via backend', e);
+    }
+  },
+
+  fetchDoctors: async (silent?: boolean) => {
+    if (!silent) set({ isLoading: true });
+    try {
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const doctors = await receptionistService.getDoctors(hospId);
+      if (doctors) {
+        set({ doctors, isLoading: false });
+      } else {
+        set({ isLoading: false });
+      }
+    } catch {
+      if (!silent) set({ isLoading: false });
+    }
+  },
+
+  toggleDoctorAvailability: async (doctorId: string, isAvailable?: boolean, reason?: string, unavailableUntil?: string) => {
+    const currentStaff = get().currentStaff;
+    const currentDoc = get().doctors.find(d => 
+      d.id === doctorId || 
+      d.staffCode === doctorId || 
+      d.staff_code === doctorId ||
+      (d.email && doctorId && d.email.toLowerCase() === doctorId.toLowerCase()) ||
+      (currentStaff?.staff_code && (d.staffCode === currentStaff.staff_code || d.staff_code === currentStaff.staff_code)) ||
+      (currentStaff?.doctorId && d.id === currentStaff.doctorId)
+    );
+    const nextAvail = typeof isAvailable === 'boolean' ? isAvailable : (currentDoc ? !currentDoc.isAvailable : true);
+    const finalReason = nextAvail ? '' : (reason !== undefined ? reason : (currentDoc?.availabilityReason || 'Temporarily Away'));
+    const finalUntil = nextAvail ? '' : (unavailableUntil !== undefined ? unavailableUntil : (currentDoc?.unavailableUntil || ''));
+
+    // Optimistically update matching doctor(s)
+    set(state => ({
+      doctors: state.doctors.map(doc => {
+        const matches = (
+          doc.id === doctorId ||
+          doc.staffCode === doctorId ||
+          doc.staff_code === doctorId ||
+          (currentDoc && doc.id === currentDoc.id) ||
+          (doc.email && doctorId && doc.email.toLowerCase() === doctorId.toLowerCase())
+        );
+        if (!matches) return doc;
+        return {
+          ...doc,
+          isAvailable: nextAvail,
+          is_available: nextAvail,
+          availabilityReason: finalReason,
+          availability_reason: finalReason,
+          unavailableUntil: finalUntil,
+          unavailable_until: finalUntil,
+        };
+      })
+    }));
+
+    const res = await receptionistService.toggleDoctorAvailability(doctorId, nextAvail, finalReason, finalUntil);
+    if (res && res.doctor) {
+      set(state => ({
+        doctors: state.doctors.map(doc => {
+          if (doc.id === res.doctor.id || (doc.staffCode && doc.staffCode === res.doctor.staffCode)) {
+            return { ...doc, ...res.doctor };
+          }
+          return doc;
+        })
+      }));
+    }
+    await get().fetchDoctors(true);
+  },
+
+  updateDoctorSlotCapacity: async (doctorId: string, timeSlot: string, availableSeats: number) => {
+    set(state => ({
+      doctors: state.doctors.map(doc => {
+        if (doc.id !== doctorId) return doc;
+        const currentSlots = doc.slotCapacities || [];
+        const updatedSlots = currentSlots.map(slot => {
+          if (slot.timeSlot !== timeSlot) return slot;
+          const offlineAvail = Math.max(0, availableSeats);
+          return {
+            ...slot,
+            offlineAvailableSeats: offlineAvail,
+            availableSeats: slot.onlineAvailableSeats + offlineAvail
+          };
+        });
+        return { ...doc, slotCapacities: updatedSlots };
+      })
+    }));
+
+    await receptionistService.updateSlotCapacity(doctorId, timeSlot, availableSeats);
+  },
+
+  updateSlotCapacity: async (doctorId: string, timeSlot: string, maxSeats: number, isAvailable = true) => {
+    const isMatch = (doc: DoctorRecord) => doc.id === doctorId || doc.staffCode === doctorId || doc.staff_code === doctorId;
+    set(state => ({
+      doctors: state.doctors.map(doc => {
+        if (!isMatch(doc)) return doc;
+        const currentSlots = doc.slotCapacities || [];
+        const updatedSlots = currentSlots.map(slot => {
+          if (slot.timeSlot !== timeSlot && slot.id !== timeSlot) return slot;
+          const onlineMax = Math.ceil(maxSeats / 2);
+          const offlineMax = Math.floor(maxSeats / 2);
+          const onlineAvail = Math.max(0, onlineMax - (slot.onlineBookedSeats || 0));
+          const offlineAvail = Math.max(0, offlineMax - (slot.offlineBookedSeats || 0));
+          return {
+            ...slot,
+            maxSeats,
+            onlineMaxSeats: onlineMax,
+            onlineAvailableSeats: onlineAvail,
+            offlineMaxSeats: offlineMax,
+            offlineAvailableSeats: offlineAvail,
+            availableSeats: onlineAvail + offlineAvail,
+            isAvailable
+          };
+        });
+        return { ...doc, slotCapacities: updatedSlots };
+      })
+    }));
+
+    const res = await receptionistService.updateSlotCapacity(doctorId, timeSlot, maxSeats, isAvailable);
+    if (res?.doctor) {
+      set(state => ({
+        doctors: state.doctors.map(d =>
+          (d.id === res.doctor.id || isMatch(d)) ? { ...d, ...res.doctor } : d
+        )
+      }));
+    }
+    await get().fetchDoctors(true);
+    return { success: !!res?.success, error: res?.error };
+  },
+
+  addTimeSlot: async (doctorId: string, timeSlot: string, maxSeats: number) => {
+    const isMatch = (doc: DoctorRecord) => doc.id === doctorId || doc.staffCode === doctorId || doc.staff_code === doctorId;
+    set(state => ({
+      doctors: state.doctors.map(doc => {
+        if (!isMatch(doc)) return doc;
+        const currentSlots = doc.slotCapacities || [];
+        const exists = currentSlots.some(s => s.timeSlot === timeSlot);
+        if (exists) return doc;
+        const newSlot = createSplitSlot(`slot-${Date.now()}`, timeSlot, maxSeats, 0, 0, true);
+        return { ...doc, slotCapacities: [...currentSlots, newSlot] };
+      })
+    }));
+
+    const res = await receptionistService.addSlot(doctorId, timeSlot, maxSeats, true);
+    if (res?.doctor) {
+      set(state => ({
+        doctors: state.doctors.map(d =>
+          (d.id === res.doctor.id || isMatch(d)) ? { ...d, ...res.doctor } : d
+        )
+      }));
+    }
+    await get().fetchDoctors(true);
+    return { success: !!res?.success, error: res?.error };
+  },
+
+  removeTimeSlot: async (doctorId: string, slotId: string) => {
+    const isMatch = (doc: DoctorRecord) => doc.id === doctorId || doc.staffCode === doctorId || doc.staff_code === doctorId;
+    set(state => ({
+      doctors: state.doctors.map(doc => {
+        if (!isMatch(doc)) return doc;
+        const currentSlots = doc.slotCapacities || [];
+        return {
+          ...doc,
+          slotCapacities: currentSlots.filter(s => s.id !== slotId && s.timeSlot !== slotId)
+        };
+      })
+    }));
+
+    const res = await receptionistService.deleteSlot(doctorId, slotId);
+    if (res?.doctor) {
+      set(state => ({
+        doctors: state.doctors.map(d =>
+          (d.id === res.doctor.id || isMatch(d)) ? { ...d, ...res.doctor } : d
+        )
+      }));
+    }
+    await get().fetchDoctors(true);
+    return { success: !!res?.success, error: res?.error };
+  },
+
+  addStandardSlots: async (doctorId: string, maxSeats: number = 6, clearExisting: boolean = false) => {
+    const isMatch = (doc: DoctorRecord) => doc.id === doctorId || doc.staffCode === doctorId || doc.staff_code === doctorId;
+    const res = await receptionistService.addStandardSlots(doctorId, maxSeats, clearExisting);
+    if (res?.doctor) {
+      set(state => ({
+        doctors: state.doctors.map(d =>
+          (d.id === res.doctor.id || isMatch(d)) ? { ...d, ...res.doctor } : d
+        )
+      }));
+    }
+    await get().fetchDoctors(true);
+    return { success: !!res?.success, doctor: res?.doctor, error: res?.error };
+  },
+
+  createDoctor: async (doctorData: Partial<DoctorRecord>) => {
+    const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id || 'hosp-bag';
+    try {
+      const created = await receptionistService.createDoctor({
+        ...doctorData,
+        hospital_id: doctorData.hospital_id || hospId,
+        hospitalId: doctorData.hospitalId || hospId,
+      });
+      if (created) {
+        const formatted: DoctorRecord = {
+          ...created,
+          isAvailable: created.isAvailable !== false,
+          department: created.department || created.specialty || 'General Medicine',
+          specialty: created.specialty || created.department || 'General Medicine',
+          photo: created.photo || '/doctor_default.jpg',
+          password: created.password || doctorData.password || 'doc123',
+        };
+        set((state) => ({
+          doctors: [formatted, ...state.doctors.filter((d) => d.id !== formatted.id)],
+        }));
+      }
+    } catch (e) {
+      console.warn('Create doctor store error:', e);
+    }
+    await get().fetchDoctors(true);
+  },
+
+  fetchTokens: async (doctorId?: string, silent?: boolean) => {
+    if (!silent) set({ isLoading: true });
+    try {
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const fetchedTokens = await receptionistService.getTokenQueue(doctorId, hospId);
+      if (fetchedTokens) {
+        // Merge fetched tokens with any pending local walk-ins to avoid wiping optimistic records
+        const fetchedIds = new Set(fetchedTokens.map((t) => t.id));
+        const localWalkIns = get().tokens.filter(
+          (t) => t.id.startsWith('tok-') && !fetchedIds.has(t.id) && (t.type || '').toLowerCase().includes('walk-in')
+        );
+        set({ tokens: [...localWalkIns, ...fetchedTokens], isLoading: false });
+      } else {
+        if (!silent) set({ isLoading: false });
+      }
+    } catch {
+      if (!silent) set({ isLoading: false });
+    }
+  },
+
+  fetchBookings: async (doctorId?: string, silent?: boolean) => {
+    if (!silent) set({ isLoading: true });
+    try {
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const fetchedBookings = await receptionistService.getBookings(hospId, doctorId);
+      set({ bookings: fetchedBookings || [], isLoading: false });
+    } catch {
+      if (!silent) set({ isLoading: false });
+    }
+  },
+
+  checkInAppointment: async (appointmentId: string) => {
+    try {
+      const res = await receptionistService.checkInPatient(appointmentId);
+      const now = new Date();
+      let hours = now.getHours();
+      const minutes = now.getMinutes().toString().padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12;
+      const nowTimeStr = `${hours.toString().padStart(2, '0')}:${minutes} ${ampm}`;
+
+      const normTarget = String(appointmentId).replace('#', '').trim().toLowerCase();
+      const isMatch = (item: any) => {
+        if (!item) return false;
+        if (item.id === appointmentId || item.appointmentId === appointmentId) return true;
+        if (item.ticketNumber === appointmentId || item.tokenNumber === appointmentId) return true;
+        const normId = String(item.id || '').replace('#', '').trim().toLowerCase();
+        const normAppId = String(item.appointmentId || '').replace('#', '').trim().toLowerCase();
+        const normTicket = String(item.ticketNumber || '').replace('#', '').trim().toLowerCase();
+        const normToken = String(item.tokenNumber || '').replace('#', '').trim().toLowerCase();
+        return normTarget === normId || normTarget === normAppId || normTarget === normTicket || normTarget === normToken;
+      };
+
+      // Optimistically update bookings and tokens
+      set((state) => ({
+        bookings: state.bookings.map((b) =>
+          isMatch(b)
+            ? {
+                ...b,
+                isCheckedIn: true,
+                status: 'Checked In',
+                checkedInAt: res?.checkedInAt || now.toISOString(),
+                checkInTime: nowTimeStr,
+                effectiveQueuePosition: res?.effectiveQueuePosition,
+                effectiveQueueTime: res?.effectiveQueueTime || nowTimeStr,
+              }
+            : b
+        ),
+        tokens: state.tokens.map((t) =>
+          isMatch(t)
+            ? {
+                ...t,
+                isCheckedIn: true,
+                status: 'Checked In',
+                checkedInAt: res?.checkedInAt || now.toISOString(),
+                checkInTime: nowTimeStr,
+                effectiveQueuePosition: res?.effectiveQueuePosition,
+                effectiveQueueTime: res?.effectiveQueueTime || nowTimeStr,
+              }
+            : t
+        ),
+      }));
+
+      // Refresh live queue and bookings roster in background
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const [newTokens, newBookings] = await Promise.all([
+        receptionistService.getTokenQueue(undefined, hospId),
+        receptionistService.getBookings(hospId, undefined),
+      ]);
+      if (newTokens) set({ tokens: newTokens });
+      if (newBookings) set({ bookings: newBookings });
+      return true;
+    } catch (e) {
+      console.warn('Failed to check in appointment', e);
+      return false;
+    }
+  },
+
+  callNextToken: async (doctorId?: string) => {
+    await receptionistService.callNextToken(doctorId);
+    const waitingTokens = get().tokens.filter(t => t.status === 'Waiting');
+    if (waitingTokens.length > 0) {
+      const targetToken = doctorId ? waitingTokens.find(t => t.doctorId === doctorId) : waitingTokens[0];
+      if (targetToken) {
+        set(state => ({
+          tokens: state.tokens.map(t => t.id === targetToken.id ? { ...t, status: 'In Consultation' } : t)
+        }));
+      }
+    }
+  },
+
+  updateTokenStatus: async (
+    tokenId: string,
+    status: TokenStatus,
+    consultationData?: {
+      diagnosis?: string;
+      assessment?: string;
+      clinicalNotes?: string;
+      prescriptionDetails?: string;
+      prescriptions?: string[];
+      checkInTime?: string;
+    }
+  ) => {
+    const now = new Date();
+    let hours = now.getHours();
+    const minutes = now.getMinutes().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12;
+    const nowTimeStr = `${hours.toString().padStart(2, '0')}:${minutes} ${ampm}`;
+
+    set((state) => ({
+      tokens: state.tokens.map((t) =>
+        t.id === tokenId
+          ? {
+              ...t,
+              status,
+              ...(status === 'Checked In' ? { checkInTime: consultationData?.checkInTime || nowTimeStr } : {}),
+              ...(consultationData?.checkInTime ? { checkInTime: consultationData.checkInTime } : {}),
+              ...(consultationData?.diagnosis ? { diagnosis: consultationData.diagnosis } : {}),
+              ...(consultationData?.assessment ? { assessment: consultationData.assessment } : {}),
+              ...(consultationData?.clinicalNotes ? { clinicalNotes: consultationData.clinicalNotes } : {}),
+              ...(consultationData?.prescriptionDetails ? { prescriptionDetails: consultationData.prescriptionDetails } : {}),
+              ...(consultationData?.prescriptions ? { prescriptions: consultationData.prescriptions } : {}),
+            }
+          : t
+      ),
+    }));
+
+    const effectiveCheckInTime = consultationData?.checkInTime || (status === 'Checked In' ? nowTimeStr : undefined);
+    await receptionistService.updateTokenStatus(tokenId, status, effectiveCheckInTime);
+  },
+
+  bookWalkInAppointment: async (payload) => {
+    const localNow = new Date();
+    const todayIso = `${localNow.getFullYear()}-${String(localNow.getMonth() + 1).padStart(2, '0')}-${String(localNow.getDate()).padStart(2, '0')}`;
+    const targetDate = payload.date || todayIso;
+    const isToday = !payload.date || payload.date === todayIso;
+
+    const targetDoc = get().doctors.find((d) => d.id === payload.doctorId);
+    const isDocAvail = targetDoc ? (targetDoc.isAvailable !== false && targetDoc.is_available !== false) : true;
+    if (targetDoc && !isDocAvail && isToday) {
+      const reason = targetDoc.availabilityReason || targetDoc.availability_reason || 'Lunch / Clinical Break';
+      throw new Error(`Dr. ${targetDoc.name} is currently marked NOT AVAILABLE (${reason}). Offline registration cannot be issued for today.`);
+    }
+
+    if (isToday && payload.timeSlot) {
+      const slotStr = String(payload.timeSlot).trim();
+      const endStr = slotStr.includes('-') ? slotStr.split('-')[1].trim() : slotStr;
+      const m = endStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+      let endMins: number | null = null;
+      if (m) {
+        let h = parseInt(m[1], 10);
+        const min = parseInt(m[2], 10);
+        const p = m[3].toUpperCase();
+        if (p === 'PM' && h < 12) h += 12;
+        if (p === 'AM' && h === 12) h = 0;
+        endMins = h * 60 + min;
+      }
+      if (endMins !== null) {
+        const curMins = localNow.getHours() * 60 + localNow.getMinutes();
+        if (curMins >= endMins) {
+          throw new Error(`The time slot '${payload.timeSlot}' has already passed for today. Please select an active or upcoming time slot.`);
+        }
+      }
+    }
+
+    const ticketNumber = `#CP-${Math.floor(1000 + Math.random() * 9000)}`;
+    const tokenNumber = `#TOK-${String(get().tokens.length + 1).padStart(3, '0')}`;
+    const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const currentHospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id || 'hosp-1';
+    const currentHospName = get().hospitalSettings?.name || 'CarePulse Medical Center';
+
+    const tempToken: TokenQueueItem = {
+      id: `tok-${Date.now()}`,
+      tokenNumber,
+      patientName: payload.patientName,
+      patientPhone: payload.patientPhone,
+      doctorId: payload.doctorId,
+      doctorName: payload.doctorName,
+      doctorSpecialty: payload.doctorSpecialty,
+      ticketNumber,
+      timeSlot: payload.timeSlot,
+      status: 'Waiting',
+      arrivalTime: nowStr,
+      issueTime: nowStr,
+      type: 'Walk-In',
+      date: targetDate,
+      age: payload.age || 30,
+      bloodGroup: payload.bloodGroup || 'O+',
+      address: payload.address || '',
+      healthIssue: payload.healthIssue || 'General Consultation',
+      hospitalId: payload.hospitalId || currentHospId,
+      hospital_id: payload.hospitalId || currentHospId,
+    };
+
+    set((state) => ({
+      tokens: [tempToken, ...state.tokens],
+      doctors: state.doctors.map((doc) => {
+        if (doc.id !== payload.doctorId) return doc;
+        return {
+          ...doc,
+          slotCapacities: (doc.slotCapacities || []).map((slot) => {
+            if (slot.timeSlot !== payload.timeSlot) return slot;
+            const offlineBooked = (slot.offlineBookedSeats || 0) + 1;
+            const offlineMax = slot.offlineMaxSeats || 3;
+            const offlineAvail = Math.max(0, offlineMax - offlineBooked);
+            const totalBooked = (slot.onlineBookedSeats || 0) + offlineBooked;
+            const totalAvail = (slot.onlineAvailableSeats || 0) + offlineAvail;
+
+            return {
+              ...slot,
+              offlineBookedSeats: offlineBooked,
+              offlineAvailableSeats: offlineAvail,
+              bookedSeats: totalBooked,
+              availableSeats: totalAvail,
+            };
+          }),
+        };
+      }),
+    }));
+
+    try {
+      const serverRes = await receptionistService.bookWalkInAppointment({
+        ...payload,
+        date: targetDate,
+        hospitalId: payload.hospitalId || currentHospId,
+        hospitalName: payload.hospitalName || currentHospName,
+      });
+
+      if (serverRes?.token) {
+        const finalToken: TokenQueueItem = {
+          ...tempToken,
+          ...serverRes.token,
+          id: serverRes.token.id || tempToken.id,
+          tokenNumber: serverRes.token.tokenNumber || tempToken.tokenNumber,
+          ticketNumber: serverRes.token.ticketNumber || serverRes.ticketNumber || tempToken.ticketNumber,
+          type: 'Walk-In',
+          status: 'Waiting',
+        };
+
+        set((state) => ({
+          tokens: state.tokens.map((t) => (t.id === tempToken.id ? finalToken : t)),
+        }));
+
+        return finalToken;
+      }
+    } catch (e: any) {
+      // Rollback optimistic token and seat counts if server rejected
+      set((state) => ({
+        tokens: state.tokens.filter((t) => t.id !== tempToken.id),
+        doctors: state.doctors.map((doc) => {
+          if (doc.id !== payload.doctorId) return doc;
+          return {
+            ...doc,
+            slotCapacities: (doc.slotCapacities || []).map((slot) => {
+              if (slot.timeSlot !== payload.timeSlot) return slot;
+              const offlineBooked = Math.max(0, (slot.offlineBookedSeats || 0) - 1);
+              const offlineMax = slot.offlineMaxSeats || 3;
+              const offlineAvail = Math.min(offlineMax, offlineMax - offlineBooked);
+              const totalBooked = Math.max(0, (slot.bookedSeats || 0) - 1);
+              const totalAvail = (slot.maxSeats || 6) - totalBooked;
+              return {
+                ...slot,
+                offlineBookedSeats: offlineBooked,
+                offlineAvailableSeats: offlineAvail,
+                bookedSeats: totalBooked,
+                availableSeats: totalAvail,
+              };
+            }),
+          };
+        }),
+      }));
+      console.warn('Backend rejected walk-in appointment:', e);
+      throw e;
+    }
+
+    return tempToken;
+  },
+
+  // Admin Actions Implementation
+  fetchReceptionists: async () => {
+    try {
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const q = hospId ? `?hospital_id=${encodeURIComponent(hospId)}` : '';
+      const res = await apiGet(`/admin/receptionists${q}`);
+      if (res.ok) {
+        const data = await res.json();
+        set({ receptionists: Array.isArray(data) ? data : [] });
+      } else {
+        set({ receptionists: [] });
+      }
+    } catch {
+      set({ receptionists: [] });
+    }
+  },
+
+  createReceptionist: async (recData: Partial<ReceptionistRecord>) => {
+    const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+    try {
+      const res = await apiPost('/admin/receptionists', {
+        name: recData.name || 'New Receptionist',
+        email: recData.email || 'receptionist@carepulse.com',
+        password: recData.password || undefined,
+        phone: recData.phone || '+91 98765 00000',
+        department: recData.department || 'Front Desk',
+        deskNumber: recData.deskNumber || 'Desk A-1',
+        shift: recData.shift || 'Morning',
+        assignedDoctorsCount: recData.assignedDoctorsCount || 2,
+        avatarUrl: recData.avatarUrl || '',
+        hospital_id: hospId,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const created = data.receptionist;
+        if (created) {
+          set((state) => ({
+            receptionists: [created, ...state.receptionists.filter((r) => r.id !== created.id)],
+          }));
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('Backend receptionist create note:', e);
+    }
+    get().fetchReceptionists();
+  },
+
+  updateReceptionist: async (id: string, updates: Partial<ReceptionistRecord>) => {
+    set((state) => ({
+      receptionists: state.receptionists.map((r) =>
+        r.id === id ? { ...r, ...updates } : r
+      ),
+    }));
+    try {
+      await apiFetch(`/admin/receptionists/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+    } catch (e) {
+      console.warn('Backend receptionist update note:', e);
+    }
+  },
+
+  deleteReceptionist: async (id: string) => {
+    set((state) => ({
+      receptionists: state.receptionists.filter((r) => r.id !== id),
+    }));
+    try {
+      await apiFetch(`/admin/receptionists/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch (e) {
+      console.warn('Backend receptionist delete note:', e);
+    }
+  },
+
+  toggleReceptionistStatus: async (id: string) => {
+    const rec = get().receptionists.find((r) => r.id === id);
+    if (!rec) return;
+    const nextStatus = !rec.isActive;
+    get().updateReceptionist(id, { isActive: nextStatus });
+  },
+
+  // Admin Nurse Actions Implementation
+  fetchNurses: async () => {
+    try {
+      const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+      const q = hospId ? `?hospital_id=${encodeURIComponent(hospId)}` : '';
+      const res = await apiGet(`/admin/nurses${q}`);
+      if (res.ok) {
+        const data = await res.json();
+        set({ nurses: Array.isArray(data) ? data : [] });
+      } else {
+        set({ nurses: [] });
+      }
+    } catch {
+      set({ nurses: [] });
+    }
+  },
+
+  createNurse: async (nurseData: Partial<NurseRecord>) => {
+    const hospId = get().currentStaff?.hospitalId || get().currentStaff?.hospital_id;
+    try {
+      const res = await apiPost('/admin/nurses', {
+        name: nurseData.name || 'New Nurse',
+        email: nurseData.email || 'nurse@carepulse.com',
+        username: nurseData.username || undefined,
+        password: nurseData.password || undefined,
+        phone: nurseData.phone || '+91 98765 00000',
+        department: nurseData.department || 'Triage & Vitals',
+        shift: nurseData.shift || 'Morning',
+        avatarUrl: nurseData.avatarUrl || '',
+        hospital_id: hospId,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const created = data.nurse;
+        if (created) {
+          set((state) => ({
+            nurses: [created, ...state.nurses.filter((n) => n.id !== created.id)],
+          }));
+          return created;
+        }
+      }
+    } catch (e) {
+      console.warn('Backend nurse create note:', e);
+    }
+    get().fetchNurses();
+    return null;
+  },
+
+  updateNurse: async (id: string, updates: Partial<NurseRecord>) => {
+    set((state) => ({
+      nurses: state.nurses.map((n) =>
+        n.id === id ? { ...n, ...updates } : n
+      ),
+    }));
+    try {
+      await apiFetch(`/admin/nurses/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+    } catch (e) {
+      console.warn('Backend nurse update note:', e);
+    }
+  },
+
+  deleteNurse: async (id: string) => {
+    set((state) => ({
+      nurses: state.nurses.filter((n) => n.id !== id),
+    }));
+    try {
+      await apiFetch(`/admin/nurses/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch (e) {
+      console.warn('Backend nurse delete note:', e);
+    }
+  },
+
+  toggleNurseStatus: async (id: string) => {
+    const nurse = get().nurses.find((n) => n.id === id);
+    if (!nurse) return;
+    const nextStatus = !nurse.isActive;
+    get().updateNurse(id, { isActive: nextStatus });
+  },
+
+  updateHospitalSettings: async (settings: Partial<HospitalSettings>) => {
+    set((state) => ({
+      hospitalSettings: { ...state.hospitalSettings, ...settings },
+    }));
+  },
+
+  updateAdminProfile: async (profile: Partial<AdminProfile>) => {
+    set((state) => ({
+      adminProfile: { ...state.adminProfile, ...profile },
+    }));
+  },
+
+  globalSlotOverride: async (
+    doctorId: string,
+    slotId: string,
+    maxSeats: number,
+    isAvailable = true
+  ) => {
+    set((state) => ({
+      doctors: state.doctors.map((doc) => {
+        if (doc.id !== doctorId) return doc;
+        return {
+          ...doc,
+          slotCapacities: doc.slotCapacities.map((slot) => {
+            if (slot.id !== slotId) return slot;
+            return createSplitSlot(
+              slot.id,
+              slot.timeSlot,
+              maxSeats,
+              slot.onlineBookedSeats,
+              slot.offlineBookedSeats,
+              isAvailable
+            );
+          }),
+        };
+      }),
+    }));
+  },
+
+  updateDoctor: async (id: string, updates: Partial<DoctorRecord>) => {
+    set((state) => ({
+      doctors: state.doctors.map((doc) =>
+        (doc.id === id || (doc.staffCode && doc.staffCode === id) || (doc.staff_code && doc.staff_code === id))
+          ? { ...doc, ...updates }
+          : doc
+      ),
+    }));
+    try {
+      await apiFetch(`/admin/doctors/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+    } catch (e) {
+      console.warn('Backend doctor update error:', e);
+    }
+  },
+
+  deleteDoctor: async (id: string) => {
+    set((state) => ({
+      doctors: state.doctors.filter((doc) => doc.id !== id),
+    }));
+    try {
+      await apiFetch(`/admin/doctors/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch (e) {
+      console.warn('Backend doctor delete error:', e);
+    }
+  },
+
+  addHospital: async (hospData: Partial<HospitalBranch>) => {
+    const newHosp: HospitalBranch = {
+      id: `hosp-${Date.now()}`,
+      name: hospData.name || 'New Hospital Location',
+      address: hospData.address || 'Medical Hub',
+      city: hospData.city || 'Metro District',
+      phone: hospData.phone || '+1 (555) 000-0000',
+      operatingHours: hospData.operatingHours || '24/7 Service',
+      doctorsCount: hospData.doctorsCount || 5,
+      receptionDesksCount: hospData.receptionDesksCount || 2,
+      logoUrl: hospData.logoUrl || '/hospital_default.jpg',
+      isActive: true,
+    };
+    set((state) => ({
+      hospitals: [newHosp, ...state.hospitals],
+    }));
+  },
+
+  updateHospital: async (id: string, updates: Partial<HospitalBranch>) => {
+    set((state) => ({
+      hospitals: state.hospitals.map((h) => (h.id === id ? { ...h, ...updates } : h)),
+    }));
+  },
+
+  deleteHospital: async (id: string) => {
+    set((state) => ({
+      hospitals: state.hospitals.filter((h) => h.id !== id),
+    }));
+  },
+
+  addDepartment: async (deptData: Partial<DepartmentRecord>) => {
+    const newDept: DepartmentRecord = {
+      id: `dept-${Date.now()}`,
+      name: deptData.name || 'New Department',
+      iconName: deptData.iconName || 'Stethoscope',
+      color: deptData.color || '#0B5A54',
+      headDoctor: deptData.headDoctor || 'Admin',
+      operatingHours: deptData.operatingHours || '08:00 AM - 08:00 PM',
+      description: deptData.description || 'Specialized clinical care department.',
+      doctorIds: deptData.doctorIds || [],
+      totalBeds: deptData.totalBeds || 20,
+      emergencyCoverage: deptData.emergencyCoverage ?? true,
+    };
+    set((state) => ({
+      departments: [newDept, ...state.departments],
+    }));
+  },
+
+  updateDepartment: async (id: string, updates: Partial<DepartmentRecord>) => {
+    set((state) => ({
+      departments: state.departments.map((d) => (d.id === id ? { ...d, ...updates } : d)),
+    }));
+  },
+
+  deleteDepartment: async (id: string) => {
+    set((state) => ({
+      departments: state.departments.filter((d) => d.id !== id),
+    }));
+  },
+
+  fetchAnnouncements: async (silent?: boolean) => {
+    try {
+      const res = await apiFetch('/communication/announcements', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && Array.isArray(data.announcements)) {
+          set({ announcements: data.announcements });
+        }
+      }
+    } catch (e) {
+      if (!silent) console.warn('Failed to fetch announcements:', e);
+    }
+  },
+
+  addAnnouncement: async (annData: Partial<AnnouncementRecord>) => {
+    try {
+      const res = await apiFetch('/communication/announcements', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: annData.title,
+          message: annData.message,
+          audience: annData.audience || 'All Staff',
+          department: annData.department || 'All',
+          priority: annData.priority || 'Normal',
+          status: annData.status || 'Sent',
+          scheduledFor: annData.scheduledFor,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.announcement) {
+          set((state) => ({
+            announcements: [data.announcement, ...state.announcements.filter(a => a.id !== data.announcement.id)],
+          }));
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('Backend announcement dispatch error, fallback to local:', e);
+    }
+    const fallbackAnn: AnnouncementRecord = {
+      id: `ann-${Date.now()}`,
+      title: annData.title || 'New Hospital Notice',
+      message: annData.message || '',
+      audience: annData.audience || 'All Staff',
+      department: annData.department,
+      priority: annData.priority || 'Normal',
+      scheduledFor: annData.scheduledFor || new Date().toLocaleString(),
+      sentAt: annData.status === 'Scheduled' ? 'Pending Dispatch' : 'Just now',
+      deliveredCount: annData.status === 'Scheduled' ? 0 : 54,
+      readCount: annData.status === 'Scheduled' ? 0 : 12,
+      status: annData.status || 'Sent',
+    };
+    set((state) => ({
+      announcements: [fallbackAnn, ...state.announcements],
+    }));
+  },
+
+  deleteAnnouncement: async (id: string) => {
+    try {
+      await apiFetch(`/communication/announcements/${id}`, { method: 'DELETE' });
+    } catch (e) {
+      console.warn('Backend delete announcement error:', e);
+    }
+    set((state) => ({
+      announcements: state.announcements.filter((a) => a.id !== id),
+    }));
+  },
+
+  fetchStaffMessages: async (silent?: boolean) => {
+    try {
+      const res = await apiFetch('/communication/messages', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && Array.isArray(data.messages)) {
+          const msgs: StaffMessage[] = data.messages;
+          const currentStaff = get().currentStaff;
+          const myId = currentStaff?.id || currentStaff?.staff_id;
+          const myCode = currentStaff?.staff_code || currentStaff?.staffCode;
+
+          const isUnreadForMe = (msg: StaffMessage) => {
+            const isFromMe = Boolean(
+              (myId && (msg.senderId === myId || msg.senderCode === myId)) ||
+              (myCode && msg.senderCode === myCode)
+            );
+            if (isFromMe) return false;
+            return !msg.isRead;
+          };
+
+          let unreadCount = 0;
+          let hasUrgentUnread = false;
+          msgs.forEach((m) => {
+            if (isUnreadForMe(m)) {
+              unreadCount++;
+              if (m.priority === 'urgent' || m.priority === 'high') hasUrgentUnread = true;
+            }
+            if (m.replies && m.replies.length > 0) {
+              m.replies.forEach((r) => {
+                if (isUnreadForMe(r)) {
+                  unreadCount++;
+                  if (r.priority === 'urgent' || r.priority === 'high') hasUrgentUnread = true;
+                }
+              });
+            }
+          });
+
+          const prevCount = get().unreadStaffMessagesCount;
+          // Trigger audio chime if new unread incoming messages arrive while browsing
+          if (unreadCount > prevCount && prevCount >= 0) {
+            if (hasUrgentUnread) {
+              playUrgentAlertSound();
+            } else {
+              playChatNotificationSound();
+            }
+          }
+
+          set({ staffMessages: msgs, unreadStaffMessagesCount: unreadCount });
+        }
+      }
+    } catch (e) {
+      if (!silent) console.warn('Failed to fetch staff messages:', e);
+    }
+  },
+
+  sendStaffMessage: async (msgData: Partial<StaffMessage>) => {
+    try {
+      const res = await apiFetch('/communication/messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          subject: msgData.subject,
+          message: msgData.message,
+          priority: msgData.priority || 'normal',
+          recipientRole: msgData.recipientRole || 'admin',
+          recipientId: msgData.recipientId,
+          parentId: msgData.parentId,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const newMsg: StaffMessage = data.data;
+        if (newMsg) {
+          set((state) => {
+            if (newMsg.parentId) {
+              return {
+                staffMessages: state.staffMessages.map((m) =>
+                  m.id === newMsg.parentId
+                    ? { ...m, replies: [...(m.replies || []), newMsg] }
+                    : m
+                ),
+              };
+            }
+            return {
+              staffMessages: [newMsg, ...state.staffMessages],
+            };
+          });
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('Error sending staff message:', e);
+    }
+    const currentStaff = get().currentStaff;
+    const fallbackMsg: StaffMessage = {
+      id: `msg-${Date.now()}`,
+      senderId: currentStaff?.id || 'staff',
+      senderName: currentStaff?.name || 'Staff Member',
+      senderRole: currentStaff?.role || 'doctor',
+      senderCode: currentStaff?.staff_code || '',
+      recipientRole: msgData.recipientRole || 'admin',
+      subject: msgData.subject || 'Support Request',
+      message: msgData.message || '',
+      priority: msgData.priority || 'normal',
+      isRead: false,
+      parentId: msgData.parentId,
+      createdAt: new Date().toISOString(),
+      replies: [],
+    };
+    set((state) => {
+      if (fallbackMsg.parentId) {
+        return {
+          staffMessages: state.staffMessages.map((m) =>
+            m.id === fallbackMsg.parentId
+              ? { ...m, replies: [...(m.replies || []), fallbackMsg] }
+              : m
+          ),
+        };
+      }
+      return {
+        staffMessages: [fallbackMsg, ...state.staffMessages],
+      };
+    });
+  },
+
+  markStaffMessageRead: async (id: string) => {
+    try {
+      await apiFetch(`/communication/messages/${id}/read`, { method: 'PATCH' });
+    } catch (e) {
+      console.warn('Error marking message read:', e);
+    }
+    set((state) => ({
+      staffMessages: state.staffMessages.map((m) => {
+        if (m.id === id) return { ...m, isRead: true };
+        if (m.replies && m.replies.some(r => r.id === id)) {
+          return {
+            ...m,
+            replies: m.replies.map(r => r.id === id ? { ...r, isRead: true } : r),
+          };
+        }
+        return m;
+      }),
+      unreadStaffMessagesCount: Math.max(0, state.unreadStaffMessagesCount - 1),
+    }));
+  },
+
+  deleteStaffMessage: async (id: string) => {
+    try {
+      await apiFetch(`/communication/messages/${id}`, { method: 'DELETE' });
+    } catch (e) {
+      console.warn('Error deleting message:', e);
+    }
+    set((state) => ({
+      staffMessages: state.staffMessages.filter((m) => m.id !== id),
+    }));
+  },
+}));

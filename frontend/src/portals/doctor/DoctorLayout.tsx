@@ -1,0 +1,1050 @@
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { Navigate, useNavigate } from 'react-router-dom';
+import {
+  LayoutDashboard,
+  Stethoscope,
+  Users,
+  FileText,
+  Settings,
+  LogOut,
+  Bell,
+  Menu,
+  X,
+  Volume2,
+  CheckCircle2,
+  ChevronDown,
+  AlertTriangle,
+  Check,
+  Radio,
+  BellRing,
+  QrCode,
+  MessageSquare,
+  Send,
+} from 'lucide-react';
+import { useStaffStore } from '../../store/staffStore';
+import { usePolling } from '../../lib/usePolling';
+import { DoctorDashboard } from './DoctorDashboard';
+import { ActiveConsultation } from './ActiveConsultation';
+import { DoctorQueue } from './DoctorQueue';
+import { DoctorEMRSearch } from './DoctorEMRSearch';
+import { DoctorProfile } from './DoctorProfile';
+import { DoctorNotificationView } from './DoctorNotificationView';
+import { DoctorNotificationCenter } from './DoctorNotificationCenter';
+import { CarePulseLogo } from '../../components/brand/CarePulseLogo';
+import { PatientQrScannerModal } from '../../components/qr/PatientQrScannerModal';
+import { Patient360RecordModal } from '../../components/qr/Patient360RecordModal';
+import type { DoctorTab } from '../../types/doctor';
+import type { TokenQueueItem, DoctorRecord } from '../../types/receptionist';
+import { playCallChime, speakDoctorAnnouncement } from '../../services/consultationService';
+import { DoctorAvailabilityModal } from './DoctorAvailabilityModal';
+import { StaffChatHub } from '../../components/chat/StaffChatHub';
+
+
+
+interface NavSection {
+  groupTitle: string;
+  items: {
+    id: DoctorTab;
+    label: string;
+    icon: React.FC<{ className?: string }>;
+    badge?: string | number;
+    badgeColor?: string;
+  }[];
+}
+
+export const DoctorLayout: React.FC = () => {
+  const [activeTab, setActiveTab] = useState<DoctorTab>('dashboard');
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+  const [activePatient, setActivePatient] = useState<TokenQueueItem | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+  const [showLogoutWarning, setShowLogoutWarning] = useState(false);
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
+  const [scannedPatientRecord, setScannedPatientRecord] = useState<any>(null);
+  const [isPatientDossierOpen, setIsPatientDossierOpen] = useState(false);
+
+  // Availability Reason Modal State
+  const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
+
+  const notifRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  const currentStaff = useStaffStore((s) => s.currentStaff);
+  const doctors = useStaffStore((s) => s.doctors);
+  const rawTokens = useStaffStore((s) => s.tokens);
+  const fetchTokens = useStaffStore((s) => s.fetchTokens);
+  const fetchDoctors = useStaffStore((s) => s.fetchDoctors);
+  const fetchAnnouncements = useStaffStore((s) => s.fetchAnnouncements);
+  const fetchStaffMessages = useStaffStore((s) => s.fetchStaffMessages);
+  const unreadStaffMessagesCount = useStaffStore((s) => s.unreadStaffMessagesCount);
+  const sendStaffMessage = useStaffStore((s) => s.sendStaffMessage);
+  const updateTokenStatus = useStaffStore((s) => s.updateTokenStatus);
+  const toggleDoctorAvailability = useStaffStore((s) => s.toggleDoctorAvailability);
+  const logoutStaff = useStaffStore((s) => s.logoutStaff);
+  const navigate = useNavigate();
+
+  // Direct Staff-Admin Message Modal State
+  const [isContactAdminOpen, setIsContactAdminOpen] = useState(false);
+  const [adminMsgSubject, setAdminMsgSubject] = useState('');
+  const [adminMsgBody, setAdminMsgBody] = useState('');
+  const [adminMsgPriority, setAdminMsgPriority] = useState<'normal' | 'high' | 'urgent'>('normal');
+  const [isSendingAdminMsg, setIsSendingAdminMsg] = useState(false);
+
+  const handleSendAdminMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminMsgSubject.trim() || !adminMsgBody.trim()) return;
+
+    setIsSendingAdminMsg(true);
+    try {
+      await sendStaffMessage({
+        subject: adminMsgSubject.trim(),
+        message: adminMsgBody.trim(),
+        priority: adminMsgPriority,
+        recipientRole: 'admin',
+      });
+      showToast('Inquiry dispatched directly to Hospital Administration.');
+      setAdminMsgSubject('');
+      setAdminMsgBody('');
+      setAdminMsgPriority('normal');
+      setIsContactAdminOpen(false);
+    } catch (err: any) {
+      showToast(err.message || 'Failed to dispatch message to administration.');
+    } finally {
+      setIsSendingAdminMsg(false);
+    }
+  };
+
+  const handlePatientLoaded = (patientData: any) => {
+    setScannedPatientRecord(patientData);
+    setIsPatientDossierOpen(true);
+    showToast(`Loaded medical record for ${patientData.patient?.fullName}`);
+  };
+
+  const handleStartConsultationFromDossier = (patientDto: any) => {
+    setIsPatientDossierOpen(false);
+    const token: TokenQueueItem = {
+      id: patientDto.id || `tok-${Date.now()}`,
+      patientId: patientDto.id,
+      tokenNumber: patientDto.patientCode || '#PAT-001',
+      ticketNumber: patientDto.patientCode || '#PAT-001',
+      patientName: patientDto.fullName,
+      patientPhone: patientDto.phone || '',
+      doctorId: activeDoctorId || 'doc-1',
+      doctorName: currentStaff?.name || 'Consulting Physician',
+      doctorSpecialty: currentStaff?.department || 'General Medicine',
+      timeSlot: 'Immediate Consultation',
+      status: 'In Consultation',
+      type: 'In-Person',
+      arrivalTime: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      issueTime: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
+      age: patientDto.age,
+      bloodGroup: patientDto.bloodGroup,
+      healthIssue: patientDto.preExistingConditions || 'Consultation initiated via QR scan',
+    };
+    setActivePatient(token);
+    setActiveTab('consultation');
+    showToast(`Initiated clinical consultation for ${patientDto.fullName}`);
+  };
+
+  const activeDoctorId = currentStaff?.doctorId || currentStaff?.doctor_id || currentStaff?.id;
+
+  // Initial fetch for doctor availability state and announcements
+  useEffect(() => {
+    fetchDoctors(true);
+    fetchAnnouncements(true);
+    fetchStaffMessages(true);
+  }, [fetchDoctors, fetchAnnouncements, fetchStaffMessages]);
+
+  // Background polling for real-time doctor queue, availability, and broadcasts sync
+  usePolling(
+    async () => {
+      await Promise.all([
+        fetchTokens(activeDoctorId, true),
+        fetchDoctors(true),
+        fetchAnnouncements(true),
+        fetchStaffMessages(true),
+      ]);
+    },
+    {
+      interval: 5000,
+      enabled: !!currentStaff && currentStaff.role === 'doctor',
+    }
+  );
+
+  // Close dropdowns on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
+        setIsNotifOpen(false);
+      }
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setIsUserMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3500);
+  };
+
+  const currentDoctor: DoctorRecord = doctors.find((d) =>
+    (activeDoctorId && (d.id === activeDoctorId || d.staffCode === activeDoctorId || d.staff_code === activeDoctorId)) ||
+    (currentStaff?.staff_code && (d.staffCode === currentStaff.staff_code || d.staff_code === currentStaff.staff_code)) ||
+    (currentStaff?.staffCode && (d.staffCode === currentStaff.staffCode || d.staff_code === currentStaff.staffCode)) ||
+    (currentStaff?.doctorId && (d.id === currentStaff.doctorId || d.staffCode === currentStaff.doctorId)) ||
+    (currentStaff?.doctor_id && (d.id === currentStaff.doctor_id || d.staffCode === currentStaff.doctor_id)) ||
+    (currentStaff?.id && (d.id === currentStaff.id || d.staffCode === currentStaff.id)) ||
+    (currentStaff?.email && d.email?.toLowerCase() === currentStaff.email.toLowerCase()) ||
+    (currentStaff?.name && d.name?.toLowerCase() === currentStaff.name.toLowerCase())
+  ) || {
+    id: currentStaff?.doctorId || currentStaff?.doctor_id || activeDoctorId || currentStaff?.staff_code || currentStaff?.id || 'doc-current',
+    name: currentStaff?.name || 'Doctor',
+    specialty: currentStaff?.department || 'General Medicine',
+    department: currentStaff?.department || 'General Medicine',
+    hospitalId: currentStaff?.hospitalId || currentStaff?.hospital_id,
+    hospital_id: currentStaff?.hospital_id || currentStaff?.hospitalId,
+    hospitalName: currentStaff?.hospitalName || currentStaff?.hospital_name,
+    hospital_name: currentStaff?.hospital_name || currentStaff?.hospitalName,
+    experienceYears: 5,
+    consultationFee: 500,
+    photo: currentStaff?.avatarUrl || '/doctor_default.jpg',
+    phone: currentStaff?.phone || '+91 98765 00000',
+    email: currentStaff?.email || 'doctor@carepulse.com',
+    roomNumber: 'Cabin 101',
+    isAvailable: true,
+    availabilityReason: '',
+    unavailableUntil: '',
+    availableDays: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+    slotCapacities: [],
+  };
+
+  const resolvedDoctorId = (currentDoctor.id && currentDoctor.id !== 'doc-current')
+    ? currentDoctor.id
+    : (currentStaff?.doctorId || currentStaff?.doctor_id || currentStaff?.staff_code || currentStaff?.staffCode || activeDoctorId || currentStaff?.id || '');
+
+  const handleOpenUnavailableModal = () => {
+    setIsAvailabilityModalOpen(true);
+  };
+
+  const handleSetAvailable = async () => {
+    await toggleDoctorAvailability(resolvedDoctorId, true, '', '');
+    showToast('Cabin status updated to: Available');
+  };
+
+  // Map live tokens or fallback
+  const doctorQueue: TokenQueueItem[] = useMemo(() => {
+    if (!rawTokens || rawTokens.length === 0) return [];
+
+    const filtered = rawTokens.filter((t) => {
+      if (!activeDoctorId) return true;
+      return (
+        t.doctorId === activeDoctorId ||
+        t.doctorId === currentStaff?.id ||
+        (t.doctorName && currentStaff?.name && t.doctorName.toLowerCase() === currentStaff.name.toLowerCase())
+      );
+    });
+
+    if (filtered.length === 0) return [];
+
+    return filtered.map((t, idx) => ({
+      ...t,
+      id: t.id || `tok-${idx}`,
+      tokenNumber: t.tokenNumber || `#TOK-00${idx + 1}`,
+      ticketNumber: t.ticketNumber || `#CP-482${idx + 1}`,
+      patientId: t.patientId || `pat-${idx + 1}`,
+      patientName: t.patientName || (t as any).name || 'Walk-In Patient',
+      patientPhone: t.patientPhone || (t as any).phone || '+91 98765 43210',
+      doctorId: t.doctorId || activeDoctorId || 'doc-current',
+      doctorName: t.doctorName || currentStaff?.name || currentDoctor.name || 'Doctor',
+      doctorSpecialty: t.doctorSpecialty || currentDoctor.specialty || 'General Medicine',
+      timeSlot: t.timeSlot || (t as any).slot || '10:00 AM - 11:00 AM',
+      status: (t.status === 'Completed' || (t.status as any) === 'Done') ? 'Completed' : t.status,
+      arrivalTime: t.arrivalTime || '09:00 AM',
+      issueTime: t.issueTime || '09:05 AM',
+      type: t.type || 'In-Person',
+      age: t.age || 34,
+      bloodGroup: t.bloodGroup || 'O+',
+      healthIssue: t.healthIssue || (t as any).issue || 'General Outpatient Consultation',
+      diagnosis: t.diagnosis || '',
+      assessment: t.assessment || '',
+      clinicalNotes: t.clinicalNotes || '',
+      prescriptions: t.prescriptions || [],
+      prescriptionDetails: t.prescriptionDetails || '',
+      isCheckedIn: t.isCheckedIn !== undefined ? t.isCheckedIn : true,
+      checkedInAt: t.checkedInAt,
+      effectiveQueuePosition: t.effectiveQueuePosition,
+      effectiveQueueTime: t.effectiveQueueTime,
+    }));
+  }, [rawTokens, activeDoctorId, currentStaff?.id, currentStaff?.name, currentDoctor.name, currentDoctor.specialty]);
+
+  // Auth Guard
+  if (!currentStaff || currentStaff.role !== 'doctor') {
+    return <Navigate to="/staff/login" replace />;
+  }
+
+  const waitingCount = doctorQueue.filter((t) => t.status === 'Waiting' || t.status === 'Checked In').length;
+
+  // Grouped Sidebar Navigation Sections
+  const navSections: NavSection[] = [
+    {
+      groupTitle: 'Clinical Workspace',
+      items: [
+        {
+          id: 'dashboard',
+          label: 'Physician Command',
+          icon: LayoutDashboard,
+        },
+        {
+          id: 'consultation',
+          label: 'Active Consultation',
+          icon: Stethoscope,
+          badge: activePatient ? 'In Cabin' : undefined,
+          badgeColor: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        },
+        {
+          id: 'queue',
+          label: 'Patient Live Queue',
+          icon: Users,
+          badge: waitingCount > 0 ? `${waitingCount}` : undefined,
+          badgeColor: 'bg-amber-50 text-amber-800 border-amber-200',
+        },
+      ],
+    },
+    {
+      groupTitle: 'Medical Archives',
+      items: [
+        {
+          id: 'emr',
+          label: 'Longitudinal EMR',
+          icon: FileText,
+        },
+      ],
+    },
+    {
+      groupTitle: 'Cabin Configuration',
+      items: [
+        {
+          id: 'profile',
+          label: 'Doctor Profile & Shift',
+          icon: Settings,
+        },
+        {
+          id: 'chat',
+          label: 'Staff Live Chat',
+          icon: MessageSquare,
+          badge: unreadStaffMessagesCount > 0 ? `${unreadStaffMessagesCount} new` : undefined,
+          badgeColor: 'bg-rose-500 text-white border-rose-600 font-bold animate-pulse shadow-xs',
+        },
+        {
+          id: 'notifications',
+          label: 'Notifications & Alerts',
+          icon: BellRing,
+          badge: waitingCount > 0 ? `${waitingCount} Live` : undefined,
+          badgeColor: 'bg-rose-50 text-rose-700 border-rose-200',
+        },
+      ],
+    },
+  ];
+
+  const handleSelectPatient = (patient: TokenQueueItem) => {
+    setActivePatient(patient);
+    setActiveTab('consultation');
+    setIsMobileSidebarOpen(false);
+  };
+
+  const handleFinishConsultation = async (consultationData: any) => {
+    if (!activePatient) return;
+    await updateTokenStatus(activePatient.id, 'Completed', consultationData);
+    showToast(`Saved consultation & prescription for ${activePatient.patientName}`);
+    setActivePatient(null);
+    setActiveTab('dashboard');
+  };
+
+  const handleQuickCallNext = () => {
+    const nextWaiting = doctorQueue.find((t) => t.status === 'Waiting' || t.status === 'Checked In');
+    if (!nextWaiting) {
+      showToast('No patients waiting in queue.');
+      return;
+    }
+    playCallChime();
+    const room = currentDoctor.roomNumber || 'Cabin 102';
+    speakDoctorAnnouncement(
+      `Token ${nextWaiting.tokenNumber}, ${nextWaiting.patientName}, please proceed to ${room}`
+    );
+    setActivePatient(nextWaiting);
+    setActiveTab('consultation');
+    showToast(`Calling Token ${nextWaiting.tokenNumber} (${nextWaiting.patientName})`);
+  };
+
+  const handleLogout = () => {
+    logoutStaff();
+    navigate('/staff/login');
+  };
+
+  const hospitalSettings = useStaffStore((s) => s.hospitalSettings);
+
+  const hospitalDisplayName =
+    currentStaff?.hospitalName ||
+    currentStaff?.hospital_name ||
+    currentDoctor.hospitalName ||
+    currentDoctor.hospital_name ||
+    (currentStaff?.hospitalId === 'hosp-bag' || currentDoctor.hospitalId === 'hosp-bag' ? 'BAG Hospital' : null) ||
+    hospitalSettings?.name ||
+    'BAG Hospital';
+
+  const getHeaderContext = () => {
+    switch (activeTab) {
+      case 'dashboard':
+        return {
+          title: hospitalDisplayName,
+          breadcrumb: '',
+        };
+      case 'consultation':
+        return {
+          title: 'Active Patient Consultation Room',
+          breadcrumb: 'Doctor Portal / Clinical Examination & SOAP',
+        };
+      case 'queue':
+        return {
+          title: "Today's Patient Queue Roster",
+          breadcrumb: 'Doctor Portal / Token Calling & Queue Stream',
+        };
+      case 'emr':
+        return {
+          title: 'Longitudinal EMR Archives & Search',
+          breadcrumb: 'Doctor Portal / Patient Medical Records',
+        };
+      case 'profile':
+        return {
+          title: 'Doctor Profile & Cabin Settings',
+          breadcrumb: 'Doctor Portal / Profile & Shift Configurations',
+        };
+      case 'notifications':
+        return {
+          title: 'Clinical Notifications & Live Feed',
+          breadcrumb: 'Doctor Portal / Real-Time Alerts & Queue Stream',
+        };
+      default:
+        return {
+          title: hospitalDisplayName,
+          breadcrumb: 'Doctor Portal / CarePulse',
+        };
+    }
+  };
+
+  const headerContext = getHeaderContext();
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFB] flex font-sans text-slate-800 antialiased selection:bg-[#0B5A54] selection:text-white">
+
+      {/* Toast Feedback Notification */}
+      {toastMessage && (
+        <div className="fixed top-5 right-5 z-50 bg-[#0B5A54] text-white px-5 py-3.5 rounded-2xl shadow-2xl border border-teal-400/30 flex items-center gap-2.5 font-bold text-xs animate-in slide-in-from-top-4 duration-300">
+          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Mobile Sidebar Backdrop */}
+      {isMobileSidebarOpen && (
+        <div
+          className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-40 lg:hidden"
+          onClick={() => setIsMobileSidebarOpen(false)}
+        />
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════
+          PERSISTENT EXECUTIVE CLINICAL SIDEBAR NAVIGATION
+      ══════════════════════════════════════════════════════════════════ */}
+      <aside
+        className={`fixed top-0 bottom-0 left-0 z-40 w-64 bg-white border-r border-slate-200/80 flex flex-col justify-between transition-transform duration-300 ease-in-out lg:translate-x-0 ${isMobileSidebarOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'
+          }`}
+      >
+        <div className="flex flex-col flex-1 min-h-0">
+          {/* ── CarePulse Brand Header ── */}
+          <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-gradient-to-r from-teal-50/20 via-white to-white">
+            <CarePulseLogo
+              variant="horizontal"
+              size="sm"
+              theme="light"
+              badge="MD"
+              subtitle="Doctor Workspace"
+              onClick={() => setActiveTab('dashboard')}
+            />
+
+            <button
+              onClick={() => setIsMobileSidebarOpen(false)}
+              className="lg:hidden p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* ── Grouped Navigation ── */}
+          <nav className="flex-1 px-3 py-2 space-y-4 overflow-y-auto no-scrollbar">
+            {navSections.map((section, sIdx) => (
+              <div key={sIdx} className="space-y-1">
+                <p className="px-3 text-[10px] font-extrabold uppercase tracking-wider text-slate-400/90 font-mono">
+                  {section.groupTitle}
+                </p>
+                <div className="space-y-0.5">
+                  {section.items.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = activeTab === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => {
+                          setActiveTab(item.id);
+                          setIsMobileSidebarOpen(false);
+                        }}
+                        className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl font-bold text-xs transition-all cursor-pointer ${isActive
+                            ? 'bg-[#0B5A54] text-white shadow-sm shadow-teal-900/20'
+                            : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/80'
+                          }`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-teal-200' : 'text-slate-400'}`} />
+                          <span className="truncate">{item.label}</span>
+                        </div>
+
+                        {item.badge && (
+                          <span
+                            className={`text-[10px] font-black px-1.5 py-0.2 rounded-full border shadow-2xs shrink-0 ${isActive
+                                ? 'bg-white/20 text-white border-white/20'
+                                : item.badgeColor || 'bg-slate-100 text-slate-600 border-slate-200'
+                              }`}
+                          >
+                            {item.badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </div>
+
+        {/* ── Sidebar Footer: Red Logout Button ── */}
+        <div className="p-3 border-t border-slate-100 bg-slate-50/40 shrink-0">
+          <button
+            onClick={() => setShowLogoutWarning(true)}
+            className="w-full py-2.5 px-4 rounded-xl bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-sm shadow-red-600/20 hover:shadow-md hover:shadow-red-600/30 transition-all cursor-pointer"
+          >
+            <LogOut className="w-4 h-4 text-white" />
+            <span>Logout</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* ══════════════════════════════════════════════════════════════════
+          MAIN CONTENT AREA & TOP BAR
+      ══════════════════════════════════════════════════════════════════ */}
+      <div className="flex-1 lg:pl-64 flex flex-col min-h-screen min-w-0 max-w-full overflow-x-hidden">
+
+        {/* ── Executive Top Bar ── */}
+        <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-slate-200/80 px-4 sm:px-8 py-3.5 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsMobileSidebarOpen(true)}
+              className="p-2 rounded-xl text-slate-500 hover:bg-slate-100 lg:hidden cursor-pointer"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+
+            <div>
+              {headerContext.breadcrumb ? (
+                <p className="text-[11px] font-bold text-slate-400 hidden sm:block">
+                  {headerContext.breadcrumb}
+                </p>
+              ) : null}
+              <h2 className="text-base sm:text-lg font-black text-slate-900 font-heading tracking-tight leading-tight">
+                {headerContext.title}
+              </h2>
+              {/* Doctor Name & Details Displayed Down the Hospital Name */}
+              <div className="flex items-center gap-1.5 sm:gap-2 mt-0.5">
+                <span className="text-xs font-bold text-[#0B5A54] flex items-center gap-1">
+                  <Stethoscope className="w-3.5 h-3.5 text-[#0B5A54] shrink-0" />
+                  <span>{currentDoctor.name || currentStaff?.name || 'Dr. Olivia Wilson'}</span>
+                </span>
+                {(currentDoctor.specialty || currentDoctor.department) && (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-slate-500 font-medium">
+                    <span className="text-slate-300">•</span>
+                    <span>{currentDoctor.specialty || currentDoctor.department}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+            {/* ── DOCTOR AVAILABILITY SEGMENTED QUICK SWITCHER ── */}
+            <div className="flex items-center bg-slate-100 p-1 rounded-2xl border border-slate-200/90 shadow-2xs">
+              <button
+                type="button"
+                onClick={handleSetAvailable}
+                className={`px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 transition-all cursor-pointer ${currentDoctor.isAvailable
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                  }`}
+                title="Mark doctor Available & Active in cabin"
+              >
+                <span className={`w-2 h-2 rounded-full ${currentDoctor.isAvailable ? 'bg-white animate-pulse' : 'bg-emerald-500'}`} />
+                <span>Available</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenUnavailableModal}
+                className={`px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 transition-all cursor-pointer ${!currentDoctor.isAvailable
+                    ? 'bg-rose-600 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/60'
+                  }`}
+                title="Mark doctor Not Available & Enter absence reason"
+              >
+                <span className={`w-2 h-2 rounded-full ${!currentDoctor.isAvailable ? 'bg-white' : 'bg-rose-500'}`} />
+                <span>Not Available</span>
+              </button>
+            </div>
+
+            {/* Quick Action: Scan Patient QR */}
+            <button
+              onClick={() => setIsQrScannerOpen(true)}
+              className="px-3 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition-all hover:scale-[1.02] active:scale-95 cursor-pointer"
+              title="Scan Patient Health ID QR Code"
+            >
+              <QrCode className="w-3.5 h-3.5 text-emerald-700" />
+              <span>Scan QR</span>
+            </button>
+
+            {/* Quick Call Next Action Button */}
+            <button
+              onClick={handleQuickCallNext}
+              className="px-3.5 py-2 rounded-xl bg-[#0B5A54] hover:bg-teal-800 text-white font-bold text-xs flex items-center gap-2 shadow-md shadow-teal-900/15 hover:shadow-lg transition-all cursor-pointer"
+              title="Call next waiting patient"
+            >
+              <Volume2 className="w-3.5 h-3.5 text-teal-200" />
+              <span className="hidden sm:inline">Call Next</span>
+            </button>
+
+            {/* Quick Action: Direct Message to Hospital Administration */}
+            <button
+              onClick={() => setActiveTab('chat')}
+              className={`px-3 py-2 rounded-xl font-extrabold text-xs flex items-center gap-1.5 shadow-2xs transition-all hover:scale-[1.02] active:scale-95 cursor-pointer relative ${
+                activeTab === 'chat'
+                  ? 'bg-purple-700 text-white shadow-md'
+                  : 'bg-purple-50 hover:bg-purple-100 text-purple-950 border border-purple-200'
+              }`}
+              title="Open direct live chat with Hospital Administration & Staff"
+            >
+              <MessageSquare className={`w-3.5 h-3.5 ${activeTab === 'chat' ? 'text-white' : 'text-purple-700'}`} />
+              <span className="hidden md:inline">Staff Chat</span>
+              {unreadStaffMessagesCount > 0 && (
+                <span className="px-1.5 py-0.2 bg-rose-500 text-white rounded-full text-[9px] font-mono font-black animate-pulse shadow-xs">
+                  {unreadStaffMessagesCount}
+                </span>
+              )}
+            </button>
+
+            {/* ── Notification Center Navbar Trigger ── */}
+            <button
+              onClick={() => setIsNotifOpen(true)}
+              className="relative flex items-center gap-2 px-3 py-2 rounded-2xl border border-slate-200/90 hover:border-teal-300 bg-white hover:bg-teal-50/40 text-slate-700 transition-all shadow-2xs cursor-pointer group"
+              title="Open Clinical Notifications & Feed"
+            >
+              <div className="relative flex items-center justify-center">
+                <Bell className="w-4 h-4 text-slate-600 group-hover:text-[#0B5A54] transition-colors" />
+                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-rose-500 rounded-full ring-2 ring-white animate-pulse" />
+              </div>
+              <div className="hidden md:flex items-center gap-1.5 text-xs font-black text-slate-800">
+                <span>Alerts</span>
+                <span className="px-1.5 py-0.2 rounded-full bg-teal-50 text-[#0B5A54] border border-teal-200/80 text-[10px] font-mono">
+                  {waitingCount > 0 ? `${waitingCount} Live` : 'Feed'}
+                </span>
+              </div>
+            </button>
+
+            {/* Doctor Profile Dropdown */}
+            <div className="relative" ref={userMenuRef}>
+              <button
+                onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}
+                className="flex items-center gap-2 p-1.5 rounded-2xl border border-slate-200 hover:border-slate-300 transition-all cursor-pointer"
+              >
+                <div className="w-8 h-8 rounded-xl bg-[#0B5A54] text-white flex items-center justify-center font-black text-xs font-heading shadow-xs">
+                  {(currentStaff?.name || 'D').charAt(0).toUpperCase()}
+                </div>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 mr-1" />
+              </button>
+
+              {isUserMenuOpen && (
+                <div className="absolute right-0 mt-2 w-64 bg-white rounded-3xl border border-slate-200 shadow-2xl p-2 z-50 animate-in fade-in duration-200 text-xs font-bold text-slate-700 space-y-1">
+                  <div className="px-3 py-2 border-b border-slate-100">
+                    <p className="font-black text-slate-900 font-heading">{currentStaff?.name || currentDoctor.name || 'Doctor'}</p>
+                    <p className="text-[10px] text-slate-400 font-medium truncate">
+                      {currentDoctor.specialty || currentStaff?.department || 'Consultant'}
+                    </p>
+                    <div className="flex items-center justify-between mt-1.5 pt-1.5 border-t border-slate-100">
+                      <span className="text-[9px] text-[#0B5A54] font-extrabold font-mono">
+                        {currentDoctor.roomNumber || 'Cabin 102'}
+                      </span>
+                      <span
+                        className={`text-[9px] font-black px-2 py-0.5 rounded-full border ${currentDoctor.isAvailable
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                            : 'bg-rose-50 text-rose-700 border-rose-200'
+                          }`}
+                      >
+                        {currentDoctor.isAvailable ? '● Available' : '○ Not Available'}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (currentDoctor.isAvailable) {
+                        handleOpenUnavailableModal();
+                      } else {
+                        handleSetAvailable();
+                      }
+                      setIsUserMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 cursor-pointer"
+                  >
+                    <Radio className="w-3.5 h-3.5 text-slate-400" />
+                    <span>Toggle Availability Status</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setActiveTab('profile');
+                      setIsUserMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 cursor-pointer"
+                  >
+                    <Settings className="w-3.5 h-3.5 text-slate-400" />
+                    <span>Cabin Settings & Profile</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsUserMenuOpen(false);
+                      setShowLogoutWarning(true);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl hover:bg-rose-50 text-rose-600 cursor-pointer"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Sign Out Cabin</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </header>
+
+        {/* ── NOT AVAILABLE REASON NOTICE BAR ── */}
+        {!currentDoctor.isAvailable && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-8 py-2.5 flex items-center justify-between gap-3 text-xs text-amber-900 animate-in fade-in duration-200">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2.5 h-2.5 rounded-full bg-rose-500 shrink-0" />
+              <div className="truncate">
+                <strong className="font-black text-amber-950">You are currently marked NOT AVAILABLE.</strong>
+                <span className="text-amber-800 ml-1.5">
+                  Reason: <em>"{currentDoctor.availabilityReason || 'Stepped Out'}"</em>
+                  {currentDoctor.unavailableUntil && <span className="font-semibold ml-1">· Expected back in {currentDoctor.unavailableUntil}</span>}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleOpenUnavailableModal}
+                className="px-2.5 py-1 rounded-lg border border-amber-300 bg-white hover:bg-amber-100 text-amber-900 font-bold text-xs transition-colors cursor-pointer"
+              >
+                Edit Reason
+              </button>
+              <button
+                type="button"
+                onClick={handleSetAvailable}
+                className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-2xs transition-all cursor-pointer flex items-center gap-1"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Go Available</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── Main Tab Content Area ── */}
+        <main className="flex-1 p-3.5 sm:p-5 lg:p-6 w-full min-w-0 max-w-full overflow-x-hidden no-scrollbar">
+          {activeTab === 'dashboard' && (
+            <DoctorDashboard
+              queue={doctorQueue}
+              activePatient={activePatient}
+              onSelectPatient={handleSelectPatient}
+              onNavigateTab={setActiveTab}
+              onShowToast={showToast}
+            />
+          )}
+
+          {activeTab === 'consultation' && (
+            <ActiveConsultation
+              patient={activePatient}
+              onFinishVisit={handleFinishConsultation}
+              onBackToDashboard={() => setActiveTab('dashboard')}
+            />
+          )}
+
+          {activeTab === 'queue' && (
+            <DoctorQueue
+              queue={doctorQueue}
+              onSelectPatient={handleSelectPatient}
+              onCallPatient={(p) => {
+                setActivePatient(p);
+                showToast(`Calling ${p.tokenNumber} to Cabin.`);
+              }}
+            />
+          )}
+
+          {activeTab === 'emr' && <DoctorEMRSearch />}
+
+          {activeTab === 'profile' && <DoctorProfile />}
+
+          {activeTab === 'notifications' && (
+            <DoctorNotificationView
+              tokens={doctorQueue}
+              onSelectPatient={handleSelectPatient}
+              onNavigateTab={(tab) => setActiveTab(tab)}
+              showToast={showToast}
+            />
+          )}
+
+          {activeTab === 'chat' && (
+            <StaffChatHub
+              currentRole="doctor"
+              currentStaffId={resolvedDoctorId}
+              currentStaffName={currentDoctor.name || currentStaff?.name || 'Doctor'}
+              hospitalId={currentStaff?.hospital_id}
+              onShowToast={showToast}
+            />
+          )}
+        </main>
+      </div>
+
+      {/* ── DOCTOR AVAILABILITY & REASON ENTRY MODAL ── */}
+      <DoctorAvailabilityModal
+        isOpen={isAvailabilityModalOpen}
+        onClose={() => setIsAvailabilityModalOpen(false)}
+        doctor={currentDoctor}
+        onSaveAvailability={async (isAvailable, reason, duration) => {
+          await toggleDoctorAvailability(resolvedDoctorId, isAvailable, reason || '', duration || '');
+          showToast(isAvailable ? 'Cabin status updated to: Available' : `Cabin status: Not Available (${reason || 'Break'})`);
+        }}
+      />
+
+      {/* ── Logout Warning Confirmation Modal ── */}
+      {showLogoutWarning && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setShowLogoutWarning(false)}
+        >
+          <div
+            className="bg-white rounded-3xl p-6 sm:p-7 max-w-sm w-full shadow-2xl border border-slate-100 text-center space-y-4 relative animate-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Close X Button */}
+            <button
+              onClick={() => setShowLogoutWarning(false)}
+              className="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            {/* Warning Icon Badge */}
+            <div className="w-14 h-14 rounded-2xl bg-red-50 border border-red-100 flex items-center justify-center text-red-600 mx-auto shadow-sm shadow-red-500/10">
+              <AlertTriangle className="w-7 h-7 text-red-600" />
+            </div>
+
+            {/* Heading & Details */}
+            <div className="space-y-1.5">
+              <h3 className="text-base sm:text-lg font-black text-slate-900 font-heading">
+                Confirm Cabin Sign Out?
+              </h3>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Are you sure you want to sign out from the Doctor Clinical Workspace? Active consultation state and live token calls for your cabin will be paused.
+              </p>
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowLogoutWarning(false)}
+                className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold text-xs transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLogoutWarning(false);
+                  handleLogout();
+                }}
+                className="flex-1 py-2.5 px-4 rounded-xl bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold text-xs shadow-md shadow-red-600/20 hover:shadow-lg hover:shadow-red-600/30 transition-all cursor-pointer flex items-center justify-center gap-1.5"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Yes, Sign Out</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Premium Doctor Notification Center Navigation Bar & Drawer ── */}
+      <DoctorNotificationCenter
+        isOpen={isNotifOpen}
+        onClose={() => setIsNotifOpen(false)}
+        tokens={doctorQueue}
+        onSelectPatient={(patient) => {
+          setActivePatient(patient);
+          setActiveTab('consultation');
+        }}
+        onNavigateTab={(tab) => setActiveTab(tab)}
+        showToast={showToast}
+      />
+
+      {/* ── Patient QR Scanner Modal ── */}
+      <PatientQrScannerModal
+        isOpen={isQrScannerOpen}
+        onClose={() => setIsQrScannerOpen(false)}
+        hospitalId={currentStaff?.hospitalId || currentStaff?.hospital_id}
+        hospitalName={currentStaff?.hospitalName || currentStaff?.hospital_name || 'CarePulse Hospital'}
+        portalRole="doctor"
+        onPatientLoaded={handlePatientLoaded}
+      />
+
+      {/* ── Patient 360 Medical Record Dossier Modal ── */}
+      <Patient360RecordModal
+        isOpen={isPatientDossierOpen}
+        onClose={() => setIsPatientDossierOpen(false)}
+        data={scannedPatientRecord}
+        portalRole="doctor"
+        onStartConsultation={handleStartConsultationFromDossier}
+      />
+
+      {/* ── Contact Hospital Administration Modal ── */}
+      {isContactAdminOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setIsContactAdminOpen(false)}
+        >
+          <div
+            className="bg-white rounded-3xl p-6 sm:p-7 max-w-lg w-full shadow-2xl border border-slate-100 space-y-5 animate-in zoom-in-95 duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 text-purple-900">
+              <div className="flex items-center gap-2">
+                <div className="p-2 bg-purple-50 text-purple-700 rounded-xl">
+                  <MessageSquare className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-black font-heading text-slate-900">
+                    Contact Hospital Administration
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Submit clinical requisitions, scheduling requests, or cabin queries
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsContactAdminOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSendAdminMessage} className="space-y-4">
+              <div className="space-y-1">
+                <label className="text-xs font-black text-slate-700">Subject / Requisition Type *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Pharmacy Stock Request / Cabin Equipment Issue"
+                  value={adminMsgSubject}
+                  onChange={(e) => setAdminMsgSubject(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-900 focus:outline-none focus:bg-white focus:ring-2 focus:ring-purple-500/20"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs font-black text-slate-700">Priority Level</label>
+                <div className="flex items-center gap-2">
+                  {(['normal', 'high', 'urgent'] as const).map((pr) => (
+                    <button
+                      key={pr}
+                      type="button"
+                      onClick={() => setAdminMsgPriority(pr)}
+                      className={`flex-1 py-1.5 rounded-xl text-xs font-black capitalize transition-all cursor-pointer border ${
+                        adminMsgPriority === pr
+                          ? pr === 'urgent'
+                            ? 'bg-rose-50 text-rose-700 border-rose-300 shadow-2xs'
+                            : pr === 'high'
+                            ? 'bg-amber-50 text-amber-800 border-amber-300 shadow-2xs'
+                            : 'bg-purple-50 text-purple-800 border-purple-300 shadow-2xs'
+                          : 'bg-slate-50 text-slate-500 border-slate-200'
+                      }`}
+                    >
+                      {pr}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-xs font-black text-slate-700">Detailed Message *</label>
+                <textarea
+                  required
+                  rows={4}
+                  placeholder="Describe your inquiry, patient transfer coordination, or requisition details..."
+                  value={adminMsgBody}
+                  onChange={(e) => setAdminMsgBody(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium text-slate-900 focus:outline-none focus:bg-white focus:ring-2 focus:ring-purple-500/20"
+                />
+              </div>
+
+              <div className="pt-2 border-t border-slate-100 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsContactAdminOpen(false)}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold transition-all cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSendingAdminMsg || !adminMsgSubject.trim() || !adminMsgBody.trim()}
+                  className="px-5 py-2 rounded-xl bg-purple-700 hover:bg-purple-800 text-white text-xs font-black shadow-md shadow-purple-900/15 flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
+                >
+                  {isSendingAdminMsg ? (
+                    <span>Sending...</span>
+                  ) : (
+                    <>
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Send to Admin</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default DoctorLayout;

@@ -1,0 +1,732 @@
+import { create } from 'zustand';
+import { Preferences } from '@capacitor/preferences';
+import type { User, Appointment, MedicalHistoryItem, ChatMessage, Doctor, BookingSelection, Prescription } from './types';
+import { INITIAL_CHAT_MESSAGES } from './mockApi';
+import { apiGet, apiFetch } from './apiFetch';
+import { signOutGoogle } from './googleAuth';
+import { registerPushNotifications } from './pushNotifications';
+import { trackUserDevice } from './deviceTracker';
+
+interface CarePulseState {
+  // Auth state
+  user: User | null;
+  isAuthenticated: boolean;
+  isInitializing: boolean;
+  isBiometricEnabled: boolean;
+  login: (phone: string) => void;
+  setUserAuth: (user: User, token?: string) => Promise<void>;
+  checkAuthSession: () => Promise<boolean>;
+  logout: () => Promise<void>;
+  toggleBiometric: (enabled: boolean) => void;
+  updateUser: (updatedFields: Partial<User>) => void;
+  registerUser: (userData: Partial<User>) => void;
+
+  // Offline / Mock Data Fallback State
+  isOfflineMode: boolean;
+  isOfflineDismissed: boolean;
+  setIsOfflineMode: (offline: boolean) => void;
+  dismissOfflineBanner: () => void;
+
+  // Appointments
+  appointments: Appointment[];
+  activeAppointment: Appointment | null;
+  addAppointment: (appointment: Appointment) => void;
+  updateAppointment: (id: string, fields: Partial<Appointment>) => void;
+  cancelAppointment: (id: string, reason?: string) => void;
+  rescheduleAppointment: (id: string, newDate: string, newSlot: string) => void;
+  syncAppointments: (patientId?: string) => Promise<void>;
+
+  // Prescriptions
+  prescriptions: Prescription[];
+  syncPrescriptions: (patientId?: string) => Promise<void>;
+
+  // Booking Flow Draft
+  booking: BookingSelection;
+  setBookingDoctor: (doctor: Doctor) => void;
+  setBookingDate: (dateStr: string) => void;
+  setBookingSlot: (slotStr: string) => void;
+  clearBooking: () => void;
+
+  // Medical History
+  history: MedicalHistoryItem[];
+  syncHistory: (patientId?: string) => Promise<void>;
+
+  // Health AI Chat
+  chatMessages: ChatMessage[];
+  latestAssessment: any | null;
+  isAiTyping: boolean;
+  addChatMessage: (msg: Omit<ChatMessage, 'id' | 'timestamp'>) => Promise<ChatMessage | null>;
+  clearChat: () => void;
+}
+
+export const clearPersistentUserStorage = async (): Promise<void> => {
+  try {
+    await Preferences.remove({ key: 'auth_token' });
+    await Preferences.remove({ key: 'carepulse_user' });
+  } catch (e) {
+    console.warn('Preferences session cleanup note:', e);
+  }
+  try {
+    localStorage.removeItem('has_logged_in');
+    localStorage.removeItem('carepulse_user');
+    localStorage.removeItem('carepulse_token');
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('google_last_email');
+    sessionStorage.removeItem('carepulse_app_unlocked');
+  } catch {}
+};
+
+const storedUser = localStorage.getItem('carepulse_user');
+let parsedUser: User | null = null;
+try {
+  parsedUser = storedUser ? JSON.parse(storedUser) : null;
+} catch {
+  parsedUser = null;
+}
+const storedBio = localStorage.getItem('carepulse_biometric_enabled');
+const hasLoggedIn = localStorage.getItem('has_logged_in') === 'true' || !!parsedUser;
+
+export const useCarePulseStore = create<CarePulseState>((set, get) => ({
+  user: parsedUser || null,
+  isAuthenticated: hasLoggedIn,
+  isInitializing: !hasLoggedIn,
+  isBiometricEnabled: storedBio === 'true',
+
+  // Offline banner states
+  isOfflineMode: false,
+  isOfflineDismissed: false,
+  setIsOfflineMode: (offline: boolean) =>
+    set((state) => ({
+      isOfflineMode: offline,
+      // If returning online, reset dismissal so next offline event warns again
+      isOfflineDismissed: offline ? state.isOfflineDismissed : false,
+    })),
+  dismissOfflineBanner: () => set({ isOfflineDismissed: true }),
+
+  login: (phone: string) => {
+    const demoPatient: User = {
+      id: `usr-${Date.now()}`,
+      fullName: 'Patient',
+      email: '',
+      phone: phone || '+91 98765 00000',
+      address: '',
+      dob: '1995-01-01',
+      gender: 'Other',
+      bloodGroup: 'O+',
+      emergencyContact: {
+        name: 'Emergency Contact',
+        phone: '+91 98765 00000',
+        relationship: 'Primary Contact',
+      },
+      avatarUrl: '',
+    };
+    localStorage.setItem('has_logged_in', 'true');
+    localStorage.setItem('carepulse_user', JSON.stringify(demoPatient));
+    try {
+      sessionStorage.setItem('carepulse_app_unlocked', 'true');
+    } catch {}
+    Preferences.set({ key: 'carepulse_user', value: JSON.stringify(demoPatient) }).catch(() => {});
+    set({
+      user: demoPatient,
+      isAuthenticated: true,
+      isInitializing: false,
+      appointments: [],
+      activeAppointment: null,
+      history: [],
+      prescriptions: [],
+    });
+    get().syncAppointments(demoPatient.id);
+    get().syncPrescriptions(demoPatient.id);
+    get().syncHistory(demoPatient.id);
+  },
+
+  setUserAuth: async (user: User, token?: string) => {
+    // 1. Immediately reset Zustand reactive state with clean empty arrays for this user
+    try {
+      sessionStorage.setItem('carepulse_app_unlocked', 'true');
+    } catch {}
+    set({
+      user,
+      isAuthenticated: true,
+      isInitializing: false,
+      appointments: [],
+      activeAppointment: null,
+      history: [],
+      prescriptions: [],
+    });
+
+    // 2. Explicitly purge any previously cached session tokens to prevent cross-user token leaks
+    try {
+      localStorage.removeItem('carepulse_token');
+      localStorage.removeItem('auth_token');
+      await Preferences.remove({ key: 'auth_token' });
+    } catch {}
+
+    // 3. Persist new user to localStorage synchronously
+    localStorage.setItem('has_logged_in', 'true');
+    localStorage.setItem('carepulse_user', JSON.stringify(user));
+    if (token && token.trim()) {
+      localStorage.setItem('carepulse_token', token.trim());
+      localStorage.setItem('auth_token', token.trim());
+    }
+
+    // 4. Persist to native Capacitor Preferences in background
+    try {
+      await Preferences.set({ key: 'carepulse_user', value: JSON.stringify(user) });
+      if (token && token.trim()) {
+        await Preferences.set({ key: 'auth_token', value: token.trim() });
+      }
+    } catch (e) {
+      console.warn('Preferences storage note:', e);
+    }
+
+    // 5. Trigger live background sync of appointments, prescriptions, and history exclusively for the new user
+    if (user && user.id) {
+      get().syncAppointments(user.id);
+      get().syncPrescriptions(user.id);
+      get().syncHistory(user.id);
+      registerPushNotifications(user.id).catch(() => {});
+      trackUserDevice(user.id).catch(() => {});
+    }
+  },
+
+  checkAuthSession: async () => {
+    try {
+      // 1. Check Capacitor Preferences and localStorage for cached user
+      let cachedUser: User | null = get().user;
+
+      if (!cachedUser) {
+        let cachedUserJson: string | null = null;
+        try {
+          const { value } = await Preferences.get({ key: 'carepulse_user' });
+          cachedUserJson = value;
+        } catch {
+          cachedUserJson = null;
+        }
+
+        if (!cachedUserJson) {
+          cachedUserJson = localStorage.getItem('carepulse_user');
+        }
+
+        if (cachedUserJson) {
+          try {
+            cachedUser = JSON.parse(cachedUserJson);
+          } catch {
+            cachedUser = null;
+          }
+        }
+      }
+
+      // Check saved biometric preference
+      try {
+        const { value: bioVal } = await Preferences.get({ key: 'carepulse_biometric_enabled' });
+        if (bioVal !== null) {
+          set({ isBiometricEnabled: bioVal === 'true' });
+        }
+      } catch {}
+
+      // 2. Check for saved JWT token
+      let token: string | null = null;
+      try {
+        const { value } = await Preferences.get({ key: 'auth_token' });
+        token = value;
+      } catch {
+        token = null;
+      }
+
+      if (!token) {
+        token = localStorage.getItem('carepulse_token') || localStorage.getItem('auth_token');
+      }
+
+      // If no token and no cached user, then user is not authenticated
+      if (!token && !cachedUser) {
+        set({
+          isInitializing: false,
+          isAuthenticated: false,
+          user: null,
+          appointments: [],
+          activeAppointment: null,
+          history: [],
+          prescriptions: [],
+        });
+        return false;
+      }
+
+      // 3. If token exists, verify & refresh latest profile from backend /api/auth/me
+      if (token) {
+        try {
+          const res = await apiGet('/auth/me', { Authorization: `Bearer ${token}` });
+          if (res && res.ok) {
+            const userData: User = await res.json();
+            await Preferences.set({ key: 'carepulse_user', value: JSON.stringify(userData) });
+            localStorage.setItem('carepulse_user', JSON.stringify(userData));
+            localStorage.setItem('has_logged_in', 'true');
+
+            set({
+              user: userData,
+              isAuthenticated: true,
+              isInitializing: false,
+            });
+
+            get().syncAppointments(userData.id);
+            get().syncPrescriptions(userData.id);
+            get().syncHistory(userData.id);
+            registerPushNotifications(userData.id).catch(() => {});
+            trackUserDevice(userData.id).catch(() => {});
+            return true;
+          } else if (res && res.status === 404) {
+            // Patient account was deleted from the database — force full logout immediately
+            console.warn('Patient account not found in database (404). Forcing logout.');
+            await clearPersistentUserStorage();
+            set({
+              user: null,
+              isAuthenticated: false,
+              isInitializing: false,
+              appointments: [],
+              activeAppointment: null,
+              history: [],
+              prescriptions: [],
+            });
+            return false;
+          } else if (res && (res.status === 401 || res.status === 403)) {
+            // Token is invalid or expired — purge everything and force re-login
+            console.warn('Token rejected (401/403). Clearing session and forcing re-login.');
+            await clearPersistentUserStorage();
+            set({
+              user: null,
+              isAuthenticated: false,
+              isInitializing: false,
+              appointments: [],
+              activeAppointment: null,
+              history: [],
+              prescriptions: [],
+            });
+            return false;
+          }
+          // For other errors (network timeout, 500, etc.) — backend is unreachable,
+          // fall through to cached user so user stays logged in during outages
+        } catch (err) {
+          console.warn('Backend unreachable during session check, using cached session:', err);
+          // Network error — fall through to use cached session (backend may be offline)
+        }
+      }
+
+      // If backend was unreachable (network error / 5xx) and we have a valid cached user,
+      // preserve the session so the user stays logged in during backend outages.
+      // NOTE: This only runs if the token call threw a network error — NOT for 401/404 responses.
+      if (cachedUser && cachedUser.id) {
+        set({
+          user: cachedUser,
+          isAuthenticated: true,
+          isInitializing: false,
+        });
+        get().syncAppointments(cachedUser.id);
+        get().syncPrescriptions(cachedUser.id);
+        get().syncHistory(cachedUser.id);
+        registerPushNotifications(cachedUser.id).catch(() => {});
+        trackUserDevice(cachedUser.id).catch(() => {});
+        return true;
+      }
+
+      set({
+        isInitializing: false,
+        isAuthenticated: false,
+        user: null,
+        appointments: [],
+        activeAppointment: null,
+        history: [],
+        prescriptions: [],
+      });
+      return false;
+    } catch {
+      // On any unexpected error, if we had a user cached, keep them logged in
+      const existingUser = get().user;
+      if (existingUser && existingUser.id) {
+        set({ isInitializing: false, isAuthenticated: true });
+        return true;
+      }
+      set({
+        isInitializing: false,
+        isAuthenticated: false,
+        user: null,
+        appointments: [],
+        activeAppointment: null,
+        history: [],
+        prescriptions: [],
+      });
+      return false;
+    }
+  },
+
+  logout: async () => {
+    // 1. Clear Google session on native Android & web
+    try {
+      await signOutGoogle();
+    } catch {}
+
+    // 2. Clear native Capacitor preferences & localStorage synchronously and asynchronously
+    await clearPersistentUserStorage();
+
+    // 3. Synchronously reset Zustand auth state and clear patient-specific records
+    set({
+      user: null,
+      isAuthenticated: false,
+      isInitializing: false,
+      appointments: [],
+      activeAppointment: null,
+      history: [],
+      prescriptions: [],
+    });
+  },
+
+  toggleBiometric: (enabled: boolean) => {
+    localStorage.setItem('carepulse_biometric_enabled', String(enabled));
+    Preferences.set({ key: 'carepulse_biometric_enabled', value: String(enabled) }).catch(() => {});
+    set({ isBiometricEnabled: enabled });
+  },
+
+  updateUser: (updatedFields) => {
+    const currentUser = get().user;
+    if (!currentUser) return;
+    const updated = { ...currentUser, ...updatedFields };
+    localStorage.setItem('carepulse_user', JSON.stringify(updated));
+    Preferences.set({ key: 'carepulse_user', value: JSON.stringify(updated) }).catch(() => {});
+    set({ user: updated });
+  },
+
+  registerUser: (userData) => {
+    const newUser: User = {
+      id: `usr-${Date.now()}`,
+      fullName: userData.fullName || 'Patient',
+      dob: userData.dob || '1995-01-01',
+      gender: (userData.gender as any) || 'Female',
+      bloodGroup: userData.bloodGroup || 'O+',
+      phone: userData.phone || '+91 98765 00000',
+      email: userData.email || '',
+      avatarUrl: userData.avatarUrl || '',
+      emergencyContact: userData.emergencyContact || {
+        name: 'Emergency Contact',
+        phone: '+91 98765 00000',
+        relationship: 'Primary Contact',
+      },
+      allergies: userData.allergies,
+      preExistingConditions: userData.preExistingConditions,
+      password: userData.password,
+    };
+    try {
+      localStorage.removeItem('carepulse_token');
+      localStorage.removeItem('auth_token');
+      Preferences.remove({ key: 'auth_token' }).catch(() => {});
+    } catch {}
+    localStorage.setItem('has_logged_in', 'true');
+    localStorage.setItem('carepulse_user', JSON.stringify(newUser));
+    Preferences.set({ key: 'carepulse_user', value: JSON.stringify(newUser) }).catch(() => {});
+    set({
+      user: newUser,
+      isAuthenticated: true,
+      isInitializing: false,
+      appointments: [],
+      activeAppointment: null,
+      history: [],
+      prescriptions: [],
+    });
+  },
+
+  appointments: [],
+  activeAppointment: null,
+  addAppointment: (appointment) => {
+    set((state) => {
+      const filtered = state.appointments.filter((a) => a.id !== appointment.id);
+      return {
+        appointments: [appointment, ...filtered],
+        activeAppointment: appointment,
+      };
+    });
+  },
+  updateAppointment: (id, fields) => {
+    set((state) => {
+      const updatedApps = state.appointments.map((app) =>
+        app.id === id ? { ...app, ...fields } : app
+      );
+      const active = state.activeAppointment?.id === id
+        ? { ...state.activeAppointment, ...fields }
+        : state.activeAppointment;
+      return { appointments: updatedApps, activeAppointment: active };
+    });
+  },
+  cancelAppointment: (id, _reason) => {
+    set((state) => {
+      const updatedApps = state.appointments.map((app) =>
+        app.id === id ? { ...app, status: 'Cancelled' as const } : app
+      );
+      const active = state.activeAppointment?.id === id
+        ? { ...state.activeAppointment, status: 'Cancelled' as const }
+        : state.activeAppointment;
+      return { appointments: updatedApps, activeAppointment: active };
+    });
+    apiFetch(`/appointments/${encodeURIComponent(id)}/cancel`, {
+      method: 'PUT',
+      body: JSON.stringify({ reason: _reason || 'Cancelled by patient' }),
+    }).catch((e) => console.warn('Cancel appointment API notice:', e));
+  },
+  rescheduleAppointment: (id, newDate, newSlot) => {
+    set((state) => {
+      const updatedApps = state.appointments.map((app) =>
+        app.id === id ? { ...app, date: newDate, timeSlot: newSlot, status: 'Upcoming' as const } : app
+      );
+      const active = state.activeAppointment?.id === id
+        ? { ...state.activeAppointment, date: newDate, timeSlot: newSlot, status: 'Upcoming' as const }
+        : state.activeAppointment;
+      return { appointments: updatedApps, activeAppointment: active };
+    });
+  },
+
+  syncAppointments: async (patientId?: string) => {
+    try {
+      const pid = patientId || get().user?.id;
+      if (!pid || pid === 'undefined' || pid === 'null') {
+        set({ appointments: [], activeAppointment: null });
+        return;
+      }
+      let res: Response | null = null;
+      try {
+        res = await apiFetch(`/appointments/patient/${encodeURIComponent(pid)}`, { method: 'GET' });
+      } catch {
+        res = null;
+      }
+      if (res && res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const active = data.find((a: any) => {
+            const s = (a.status || '').toLowerCase();
+            return s !== 'completed' && s !== 'cancelled' && s !== 'rejected' && s !== 'archived';
+          });
+          set({
+            appointments: data,
+            activeAppointment: active || null,
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('Sync appointments notice:', e);
+    }
+  },
+
+  prescriptions: [],
+  syncPrescriptions: async (patientId?: string) => {
+    try {
+      const pid = patientId || get().user?.id;
+      if (!pid || pid === 'undefined' || pid === 'null') {
+        set({ prescriptions: [] });
+        return;
+      }
+      let res: Response | null = null;
+      try {
+        res = await apiFetch(`/prescriptions/patient/${encodeURIComponent(pid)}`, { method: 'GET' });
+      } catch {
+        res = null;
+      }
+      if (res && res.ok) {
+        const data = await res.json();
+        set({ prescriptions: Array.isArray(data) ? data : [] });
+      } else {
+        set({ prescriptions: [] });
+      }
+    } catch (e) {
+      console.warn('Sync prescriptions notice:', e);
+      set({ prescriptions: [] });
+    }
+  },
+
+  booking: {
+    doctor: null,
+    date: new Date().toISOString().split('T')[0],
+    slot: null,
+  },
+  setBookingDoctor: (doctor) => set((s) => ({ booking: { ...s.booking, doctor, doctorId: doctor.id } })),
+  setBookingDate: (date) => set((s) => ({ booking: { ...s.booking, date } })),
+  setBookingSlot: (slot) => set((s) => ({ booking: { ...s.booking, slot } })),
+  clearBooking: () =>
+    set({
+      booking: {
+        doctor: null,
+        date: new Date().toISOString().split('T')[0],
+        slot: null,
+      },
+    }),
+
+  history: [],
+  syncHistory: async (patientId?: string) => {
+    try {
+      const pid = patientId || get().user?.id;
+      if (!pid || pid === 'undefined' || pid === 'null') {
+        set({ history: [] });
+        return;
+      }
+      let res: Response | null = null;
+      try {
+        res = await apiFetch(`/consultations/patient/${encodeURIComponent(pid)}`, { method: 'GET' });
+      } catch {
+        res = null;
+      }
+      if (res && res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const mapped: MedicalHistoryItem[] = data.map((c: any) => ({
+            id: c.id,
+            appointmentId: c.appointmentId || c.appointment_id || c.soapData?.appointment_id || c.soapData?.appointmentId,
+            ticketNumber: c.ticketNumber || c.ticket_number || c.soapData?.ticket_number || c.soapData?.ticketNumber,
+            date: c.date,
+            time: 'Consultation',
+            doctorId: c.doctorId,
+            doctorName: c.doctorName || 'Specialist Doctor',
+            specialty: c.doctorSpecialty || 'General Consultation',
+            hospitalId: c.hospitalId,
+            hospital_id: c.hospitalId,
+            hospitalName: c.hospitalName || 'CarePulse Central Hospital',
+            diagnosis: c.diagnosis || 'Clinical consultation recorded.',
+            prescriptionDetails: c.prescriptionDetails || 'Prescription notes provided.',
+            prescriptions: c.prescriptions || c.soapData?.prescriptions || [],
+            soapData: c.soapData,
+            status: 'Completed',
+            specialtyIcon: 'stethoscope'
+          }));
+          set({ history: mapped });
+        }
+      }
+    } catch (e) {
+      console.warn('Sync history notice:', e);
+    }
+  },
+
+  chatMessages: INITIAL_CHAT_MESSAGES,
+  latestAssessment: null,
+  isAiTyping: false,
+  addChatMessage: async (msg) => {
+    const userMsg: ChatMessage = {
+      ...msg,
+      id: `msg-${Date.now()}`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    const currentHistory = get().chatMessages;
+    set({
+      chatMessages: [...currentHistory, userMsg],
+    });
+
+    if (msg.sender === 'user') {
+      set({ isAiTyping: true });
+      try {
+        const formattedHistory = [...currentHistory, userMsg].map((m) => ({
+          role: m.sender === 'user' ? 'user' : 'assistant',
+          content: m.text,
+        }));
+
+        const user = get().user;
+        const patientContext = user
+          ? `Patient Name: ${user.fullName}, Gender: ${user.gender || 'Not specified'}, Blood: ${user.bloodGroup || 'Not specified'}, Allergies: ${user.allergies || 'None'}, Conditions: ${user.preExistingConditions || 'None'}`
+          : '';
+
+        let res: Response | null = null;
+        try {
+          res = await apiFetch('/health-assistant/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: formattedHistory,
+              patient_context: patientContext,
+            }),
+          });
+        } catch {
+          res = null;
+        }
+
+        if (!res || !res.ok) {
+          try {
+            res = await apiFetch('/ai/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                messages: formattedHistory,
+                patient_context: patientContext,
+              }),
+            });
+          } catch {
+            res = null;
+          }
+        }
+
+        if (res && res.ok) {
+          const aiData = await res.json();
+          const replyText = aiData.reply || aiData.response;
+          if (replyText) {
+            const isFailure = replyText.includes("currently not working") || replyText.includes("currently unavailable");
+            const botMsg: ChatMessage = {
+              id: `msg-${Date.now() + 1}`,
+              sender: 'bot',
+              text: replyText,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              quickReplyChips: isFailure
+                ? ['Try Again', 'Book Doctor Visit', '🚨 Emergency (108)']
+                : (aiData.quickReplyChips || []),
+              confidence: isFailure ? 0 : (aiData.confidence_score ?? 88),
+              riskLevel: isFailure ? 'low' : (aiData.risk_level ?? 'low'),
+              specialty: isFailure ? undefined : ((aiData.suggested_specialties && aiData.suggested_specialties[0]) || 'General Medicine'),
+              isEmergency: aiData.is_emergency ?? false,
+              soapNote: isFailure ? undefined : aiData.soap_note,
+            };
+
+            set((state) => ({
+              chatMessages: [...state.chatMessages, botMsg],
+              latestAssessment: (!isFailure && aiData.soap_note) ? {
+                subjective: aiData.soap_note.subjective || msg.text,
+                objective: aiData.soap_note.objective || 'Pending in-person clinical examination.',
+                assessmentDiagnosis: aiData.soap_note.assessment || `${aiData.suggested_specialties?.[0] || 'General Medicine'} Evaluation`,
+                plan: aiData.soap_note.plan || 'Schedule specialist consultation for formal assessment.',
+                confidence: aiData.confidence_score ?? 88,
+                riskLevel: aiData.risk_level ?? 'low',
+                specialty: aiData.suggested_specialties?.[0] || 'General Medicine',
+              } : state.latestAssessment,
+              isAiTyping: false,
+            }));
+            return botMsg;
+          }
+        }
+      } catch (err) {
+        console.warn('Health AI Chat API error:', err);
+      }
+
+      // If AI service is unreachable or failed: display transparent failure notification (NO default mock messages)
+      const lower = msg.text.toLowerCase();
+      const isEmergency = lower.includes('chest pain') || lower.includes('cannot breathe') || lower.includes('severe breathlessness') || lower.includes('unconscious');
+
+      const failureReply = isEmergency
+        ? "🚨 CRITICAL SAFETY ALERT: Severe chest pain, pressure, or acute shortness of breath requires IMMEDIATE emergency medical attention. Please call 108 / 911 or visit the nearest ER right away."
+        : "The AI is currently not working. Please try again later or consult a doctor directly.";
+
+      const failureChips = isEmergency
+        ? ['🚨 Call 108 Emergency', 'Find Nearest ER', 'Emergency Contact']
+        : ['Try Again', 'Book Doctor Visit', '🚨 Emergency (108)'];
+
+      const botMsg: ChatMessage = {
+        id: `msg-${Date.now() + 1}`,
+        sender: 'bot',
+        text: failureReply,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        quickReplyChips: failureChips,
+        confidence: isEmergency ? 99 : 0,
+        riskLevel: isEmergency ? 'critical' : 'low',
+        specialty: isEmergency ? 'Emergency Medicine' : undefined,
+        isEmergency,
+      };
+
+      set((state) => ({
+        chatMessages: [...state.chatMessages, botMsg],
+        isAiTyping: false,
+      }));
+      return botMsg;
+    }
+    return null;
+  },
+  clearChat: () => set({ chatMessages: INITIAL_CHAT_MESSAGES, latestAssessment: null }),
+}));

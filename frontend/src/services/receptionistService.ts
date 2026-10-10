@@ -1,0 +1,406 @@
+import type { DoctorRecord, TokenQueueItem, TokenStatus, ReceptionistProfile } from '../types/receptionist';
+import { apiFetch } from '../lib/apiFetch';
+
+export const receptionistService = {
+  async getDoctors(hospitalId?: string): Promise<DoctorRecord[]> {
+    try {
+      const q = hospitalId ? `?hospital_id=${encodeURIComponent(hospitalId)}` : '';
+      let res = await apiFetch(`/admin/doctors${q}`, { method: 'GET' });
+      if (!res.ok) {
+        res = await apiFetch(`/receptionist/doctors${q}`, { method: 'GET' });
+      }
+      if (!res.ok) {
+        res = await apiFetch(`/doctors${q}`, { method: 'GET' });
+      }
+      if (res.ok) {
+        const data = await res.json();
+        const docs = Array.isArray(data) ? data : (data.doctors || []);
+        return docs.map((d: any) => ({
+          ...d,
+          isAvailable: d.isAvailable !== false && d.is_available !== false,
+          is_available: d.isAvailable !== false && d.is_available !== false,
+          availabilityReason: d.availabilityReason || d.availability_reason || '',
+          availability_reason: d.availabilityReason || d.availability_reason || '',
+          unavailableUntil: d.unavailableUntil || d.unavailable_until || '',
+          unavailable_until: d.unavailableUntil || d.unavailable_until || '',
+          department: d.department || d.specialty || 'General Medicine',
+          specialty: d.specialty || d.department || 'General Medicine',
+          photo: d.photo || d.photoUrl || d.photo_url || '/doctor_default.jpg',
+          password: d.password || 'doc123',
+        }));
+      }
+    } catch (e) {
+      console.warn('Backend server offline, returning fallback doctor records', e);
+    }
+    return [];
+  },
+
+  async createDoctor(payload: Partial<DoctorRecord>): Promise<DoctorRecord | null> {
+    try {
+      let res = await apiFetch('/admin/doctors', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        res = await apiFetch('/receptionist/doctors', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+      }
+      if (res.ok) {
+        const data = await res.json();
+        const doc = data.doctor;
+        if (doc) {
+          return {
+            ...doc,
+            isAvailable: doc.isAvailable !== false && doc.is_available !== false,
+            is_available: doc.isAvailable !== false && doc.is_available !== false,
+            availabilityReason: doc.availabilityReason || doc.availability_reason || '',
+            availability_reason: doc.availabilityReason || doc.availability_reason || '',
+            unavailableUntil: doc.unavailableUntil || doc.unavailable_until || '',
+            unavailable_until: doc.unavailableUntil || doc.unavailable_until || '',
+            department: doc.department || doc.specialty || 'General Medicine',
+            specialty: doc.specialty || doc.department || 'General Medicine',
+            photo: doc.photo || doc.photoUrl || doc.photo_url || '/doctor_default.jpg',
+            password: doc.password || payload.password || 'doc123',
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to create doctor via backend API', e);
+    }
+    return null;
+  },
+
+  async toggleDoctorAvailability(doctorId: string, isAvailable: boolean, reason?: string, unavailableUntil?: string): Promise<{ success: boolean; doctor?: any }> {
+    try {
+      const payload = {
+        isAvailable,
+        is_available: isAvailable,
+        reason: reason || '',
+        availabilityReason: reason || '',
+        availability_reason: reason || '',
+        unavailableUntil: unavailableUntil || '',
+        unavailable_until: unavailableUntil || '',
+      };
+
+      const encodedId = encodeURIComponent(doctorId);
+      let res = await apiFetch(`/receptionist/doctors/${encodedId}/availability`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        res = await apiFetch(`/doctor/${encodedId}/availability`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+      }
+
+      if (!res.ok) {
+        res = await apiFetch(`/doctor/availability`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+      }
+
+      if (!res.ok) {
+        res = await apiFetch(`/doctors/${encodedId}/availability`, {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        });
+      }
+
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        return { success: true, doctor: data?.doctor };
+      }
+      return { success: false };
+    } catch (e) {
+      console.warn('Failed to toggle doctor availability', e);
+      return { success: false };
+    }
+  },
+
+  async updateSlotCapacity(doctorId: string, timeSlot: string, maxSeats: number, isAvailable: boolean = true): Promise<{ success: boolean; doctor?: any; slot?: any; error?: string }> {
+    try {
+      const res = await apiFetch(`/receptionist/doctors/${encodeURIComponent(doctorId)}/slots`, {
+        method: 'PUT',
+        body: JSON.stringify({ timeSlot, maxSeats, isAvailable }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, doctor: data.doctor, slot: data.slot };
+      }
+      return { success: false, error: data.detail || 'Failed to update slot capacity' };
+    } catch (e: any) {
+      console.warn('Failed to update slot capacity', e);
+      return { success: false, error: e?.message || 'Network error' };
+    }
+  },
+
+  async addSlot(doctorId: string, timeSlot: string, maxSeats: number = 6, isAvailable: boolean = true): Promise<{ success: boolean; doctor?: any; slot?: any; error?: string }> {
+    try {
+      const res = await apiFetch(`/receptionist/doctors/${encodeURIComponent(doctorId)}/slots`, {
+        method: 'POST',
+        body: JSON.stringify({ timeSlot, maxSeats, isAvailable }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, doctor: data.doctor, slot: data.slot };
+      }
+      return { success: false, error: data.detail || 'Failed to add slot' };
+    } catch (e: any) {
+      console.warn('Failed to add slot', e);
+      return { success: false, error: e?.message || 'Network error' };
+    }
+  },
+
+  async deleteSlot(doctorId: string, slotId: string): Promise<{ success: boolean; doctor?: any; slotId?: string; error?: string }> {
+    try {
+      const res = await apiFetch(`/receptionist/doctors/${encodeURIComponent(doctorId)}/slots/${encodeURIComponent(slotId)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, doctor: data.doctor, slotId: data.slotId };
+      }
+      return { success: false, error: data.detail || 'Failed to delete slot' };
+    } catch (e: any) {
+      console.warn('Failed to delete slot', e);
+      return { success: false, error: e?.message || 'Network error' };
+    }
+  },
+
+  async addStandardSlots(doctorId: string, maxSeats: number = 6, clearExisting: boolean = false): Promise<{ success: boolean; doctor?: any; slots?: any[]; error?: string }> {
+    try {
+      const res = await apiFetch(`/receptionist/doctors/${encodeURIComponent(doctorId)}/standard-slots`, {
+        method: 'POST',
+        body: JSON.stringify({ maxSeats, clearExisting }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, doctor: data.doctor, slots: data.slots };
+      }
+      return { success: false, error: data.detail || 'Failed to add standard slots' };
+    } catch (e: any) {
+      console.warn('Failed to add standard slots', e);
+      return { success: false, error: e?.message || 'Network error' };
+    }
+  },
+
+  async getTokenQueue(doctorId?: string, hospitalId?: string): Promise<TokenQueueItem[]> {
+    try {
+      const params = new URLSearchParams();
+      if (doctorId) params.append('doctor_id', doctorId);
+      if (hospitalId) params.append('hospital_id', hospitalId);
+      const query = params.toString() ? `?${params.toString()}` : '';
+      const res = await apiFetch(`/receptionist/tokens${query}`, { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.tokens || [];
+      }
+    } catch (e) {
+      console.warn('Backend server offline, returning token queue fallback', e);
+    }
+    return [];
+  },
+
+  async getBookings(hospitalId?: string, doctorId?: string): Promise<TokenQueueItem[]> {
+    try {
+      const params = new URLSearchParams();
+      if (doctorId) params.append('doctor_id', doctorId);
+      if (hospitalId) params.append('hospital_id', hospitalId);
+      const query = params.toString() ? `?${params.toString()}` : '';
+      const res = await apiFetch(`/receptionist/bookings${query}`, { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.tokens || [];
+      }
+    } catch (e) {
+      console.warn('Backend server offline, returning bookings fallback', e);
+    }
+    return [];
+  },
+
+  async checkInPatient(appointmentId: string): Promise<any> {
+    try {
+      const res = await apiFetch(`/receptionist/appointments/${encodeURIComponent(appointmentId)}/check-in`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch (e) {
+      console.warn('Failed to check in patient via backend API', e);
+    }
+    return null;
+  },
+
+  async callNextToken(doctorId?: string): Promise<TokenQueueItem | null> {
+    try {
+      const path = doctorId ? `/receptionist/tokens/call-next?doctor_id=${doctorId}` : '/receptionist/tokens/call-next';
+      const res = await apiFetch(path, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.activeToken || null;
+      }
+    } catch (e) {
+      console.warn('Failed to call next token', e);
+    }
+    return null;
+  },
+
+  async updateTokenStatus(tokenId: string, status: TokenStatus, checkInTime?: string): Promise<boolean> {
+    try {
+      const res = await apiFetch(`/receptionist/tokens/${tokenId}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status, checkInTime }),
+      });
+      return res.ok;
+    } catch (e) {
+      console.warn('Failed to update token status', e);
+      return false;
+    }
+  },
+
+  async bookWalkInAppointment(payload: {
+    patientName: string;
+    patientPhone: string;
+    doctorId: string;
+    doctorName: string;
+    doctorSpecialty: string;
+    date: string;
+    timeSlot: string;
+    age?: number;
+    bloodGroup?: string;
+    address?: string;
+    healthIssue?: string;
+    hospitalId?: string;
+    hospital_id?: string;
+    hospitalName?: string;
+    hospital_name?: string;
+  }): Promise<{ ticketNumber: string; token: TokenQueueItem } | null> {
+
+    try {
+      const res = await apiFetch('/receptionist/appointments', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+      const errData = await res.json().catch(() => null);
+      const errMsg = errData?.detail || errData?.message || `Failed to book walk-in appointment (Status: ${res.status})`;
+      throw new Error(errMsg);
+    } catch (e) {
+      console.warn('Failed to book walkin appointment:', e);
+      throw e;
+    }
+  },
+
+  async getProfile(): Promise<ReceptionistProfile | null> {
+    try {
+      const res = await apiFetch('/receptionist/profile', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.profile || null;
+      }
+    } catch (e) {
+      console.warn('Failed to load receptionist profile from API', e);
+    }
+    return null;
+  },
+
+  async updateProfile(updates: Partial<ReceptionistProfile>): Promise<ReceptionistProfile | null> {
+    try {
+      const res = await apiFetch('/receptionist/profile', {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return data.profile || null;
+      }
+    } catch (e) {
+      console.warn('Failed to update receptionist profile via API', e);
+    }
+    return null;
+  },
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<{ success: boolean; message?: string }> {
+    try {
+      const res = await apiFetch('/receptionist/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        return { success: true, message: data.message };
+      }
+      return { success: false, message: data.detail || data.message || 'Failed to update password.' };
+    } catch (e: any) {
+      return { success: false, message: e.message || 'Network error updating password.' };
+    }
+  },
+
+  async getHospitalDoctorLeaves(): Promise<any[]> {
+    try {
+      const res = await apiFetch('/receptionist/leaves', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.leaves || [];
+      }
+    } catch (e) {
+      console.warn('Failed to fetch hospital doctor leaves', e);
+    }
+    return [];
+  },
+
+  async updateDoctorLeaveStatus(leaveId: string, status: string): Promise<any> {
+    const res = await apiFetch(`/receptionist/leaves/${encodeURIComponent(leaveId)}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to update leave status' }));
+      throw new Error(err.detail || `Failed with status ${res.status}`);
+    }
+    return await res.json();
+  },
+
+  async createNurseRequest(payload: {
+    fullName: string;
+    email: string;
+    phone?: string;
+    department?: string;
+    shift?: string;
+    specialization?: string;
+    notes?: string;
+  }): Promise<{ success: boolean; request: any; message: string }> {
+    const res = await apiFetch('/receptionist/nurse-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to submit nurse onboarding request' }));
+      throw new Error(err.detail || `Failed with status ${res.status}`);
+    }
+    return await res.json();
+  },
+
+  async getNurseRequests(): Promise<any[]> {
+    try {
+      const res = await apiFetch('/receptionist/nurse-requests', { method: 'GET' });
+      if (res.ok) {
+        const data = await res.json();
+        return data.requests || [];
+      }
+    } catch (e) {
+      console.warn('Failed to fetch nurse requests for receptionist', e);
+    }
+    return [];
+  },
+};

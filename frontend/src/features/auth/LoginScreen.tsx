@@ -1,0 +1,627 @@
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { Activity, Lock, ArrowRight, AlertCircle, User, UserPlus } from 'lucide-react';
+import { Card } from '../../components/ui/Card';
+import { Input } from '../../components/ui/Input';
+import { Button } from '../../components/ui/Button';
+import { useCarePulseStore } from '../../lib/store';
+import { useStaffStore } from '../../store/staffStore';
+import {
+  authenticateWithBackend,
+  GOOGLE_CLIENT_ID,
+  parseJwt,
+  loadGoogleScript,
+  useGoogleAuth,
+} from '../../lib/googleAuth';
+import { ForgotPasswordModal } from './ForgotPasswordModal';
+import { apiPost } from '../../lib/apiFetch';
+import { shouldPromptProfileCompletion } from './CompleteProfileScreen';
+import { useTranslation } from '../../i18n';
+import { CarePulseLogo } from '../../components/brand/CarePulseLogo';
+
+export const LoginScreen: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { t } = useTranslation();
+  const setUserAuth = useCarePulseStore((s) => s.setUserAuth);
+
+  const [phone, setPhone] = useState('');
+  const [password, setPassword] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const { signIn: googleSignIn, isLoading: isGoogleLoading, error: googleError, setError: setGoogleError } = useGoogleAuth();
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [resetSuccessMessage, setResetSuccessMessage] = useState<string | null>(null);
+  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
+
+  // Sign up modal prompt state
+  const [showSignupPrompt, setShowSignupPrompt] = useState(false);
+  const [unregisteredIdentifier, setUnregisteredIdentifier] = useState('');
+
+  const isAuthenticated = useCarePulseStore((s) => s.isAuthenticated);
+  const user = useCarePulseStore((s) => s.user);
+  const currentStaff = useStaffStore((s) => s.currentStaff);
+
+  // If already authenticated as patient or staff, redirect to appropriate portal immediately
+  useEffect(() => {
+    if (currentStaff) {
+      if (currentStaff.role === 'doctor') navigate('/doctor', { replace: true });
+      else if (currentStaff.role === 'receptionist') navigate('/receptionist', { replace: true });
+      else if (currentStaff.role === 'admin') navigate('/admin', { replace: true });
+      else if (currentStaff.role === 'nurse') navigate('/nurse', { replace: true });
+      else if (currentStaff.role === 'superadmin') navigate('/superadmin', { replace: true });
+      return;
+    }
+
+    if (isAuthenticated && user) {
+      navigate('/home', { replace: true });
+    }
+  }, [isAuthenticated, user, currentStaff, navigate]);
+
+  // Handle redirect messages (e.g. "Please log in to continue")
+  useEffect(() => {
+    if (location.state?.message) {
+      setErrorMessage(location.state.message);
+    }
+  }, [location.state]);
+
+  // Sync google auth error to local error message
+  useEffect(() => {
+    if (googleError) {
+      setErrorMessage(googleError);
+    }
+  }, [googleError]);
+
+  // Handle OAuth Token / Session detection
+  useEffect(() => {
+    let isMounted = true;
+
+    // 1. Check for token in URL query (standard OAuth redirect callback)
+    const checkRedirectToken = async () => {
+      const params = new URLSearchParams(window.location.search);
+      const urlToken = params.get('token');
+      const accessToken = params.get('access_token');
+
+      if (urlToken) {
+        try {
+          const authResult = await authenticateWithBackend({ credential: urlToken });
+          if (authResult?.user) {
+            await setUserAuth(authResult.user, authResult.token);
+            window.history.replaceState(null, '', window.location.pathname);
+            if (shouldPromptProfileCompletion(authResult.user)) {
+              navigate('/complete-profile', { replace: true });
+            } else {
+              navigate('/home', { replace: true });
+            }
+            return;
+          }
+        } catch (err: any) {
+          console.error('URL token error:', err);
+        }
+      }
+
+      if (accessToken) {
+        try {
+          const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          const profile = await res.json();
+          if (profile?.email) {
+            const authResult = await authenticateWithBackend({
+              profile: {
+                email: profile.email,
+                name: profile.name || profile.email.split('@')[0],
+                picture: profile.picture || '',
+                googleId: profile.sub,
+              },
+            });
+            if (authResult?.user) {
+              await setUserAuth(authResult.user, authResult.token);
+              window.history.replaceState(null, '', window.location.pathname);
+              if (shouldPromptProfileCompletion(authResult.user)) {
+                navigate('/complete-profile', { replace: true });
+              } else {
+                navigate('/home', { replace: true });
+              }
+              return;
+            }
+          }
+        } catch (err: any) {
+          console.error('Access token error:', err);
+        }
+      }
+
+      // Check URL hash for access_token (Google Implicit flow fallback on mobile web)
+      if (window.location.hash && window.location.hash.includes('access_token=')) {
+        const hashParams = new URLSearchParams(window.location.hash.substring(1));
+        const hashAccessToken = hashParams.get('access_token');
+        if (hashAccessToken) {
+          setErrorMessage(null);
+          try {
+            const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+              headers: { Authorization: `Bearer ${hashAccessToken}` },
+            });
+            const gProfile = await userRes.json();
+            if (gProfile?.email) {
+              const authResult = await authenticateWithBackend({
+                profile: {
+                  email: gProfile.email,
+                  name: gProfile.name || gProfile.email.split('@')[0],
+                  picture: gProfile.picture || '',
+                  googleId: gProfile.sub,
+                },
+              });
+              if (authResult?.user) {
+                await setUserAuth(authResult.user, authResult.token);
+                window.history.replaceState(null, '', window.location.pathname);
+                if (shouldPromptProfileCompletion(authResult.user)) {
+                  navigate('/complete-profile', { replace: true });
+                } else {
+                  navigate('/home', { replace: true });
+                }
+                return;
+              }
+            }
+          } catch (err: any) {
+            console.error('Google OAuth redirect token error:', err);
+            setErrorMessage('Failed to sign in with Google account.');
+          }
+        }
+      }
+    };
+
+    checkRedirectToken();
+
+    // 2. Initialize Google Identity Services for web One-Tap & buttons
+    const initGoogle = async () => {
+      try {
+        await loadGoogleScript();
+        if (!isMounted) return;
+
+        if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID.trim() !== '') {
+          if (window.google?.accounts?.id) {
+            window.google.accounts.id.initialize({
+              client_id: GOOGLE_CLIENT_ID,
+              auto_select: false,
+              callback: async (response: { credential: string }) => {
+                try {
+                  setErrorMessage(null);
+                  const authResult = await authenticateWithBackend({ credential: response.credential });
+                  if (authResult?.user) {
+                    await setUserAuth(authResult.user, authResult.token);
+                    if (shouldPromptProfileCompletion(authResult.user)) {
+                      navigate('/complete-profile', { replace: true });
+                    } else {
+                      navigate('/home', { replace: true });
+                    }
+                  }
+                } catch (err: any) {
+                  console.error('Backend Google Auth error:', err);
+                  const decoded = parseJwt(response.credential);
+                  if (decoded?.email) {
+                    const fallbackUser = {
+                      id: decoded.sub || `usr-${Date.now()}`,
+                      fullName: decoded.name || decoded.email.split('@')[0],
+                      email: decoded.email,
+                      phone: '',
+                      dob: '1995-07-24',
+                      gender: 'Not specified',
+                      bloodGroup: 'O+',
+                      emergencyContact: { name: 'Emergency Contact', phone: '+1 555-0199', relationship: 'Primary' },
+                      avatarUrl: '',
+                      authProvider: 'google',
+                    };
+                    await setUserAuth(fallbackUser, response.credential);
+                    if (shouldPromptProfileCompletion(fallbackUser)) {
+                      navigate('/complete-profile', { replace: true });
+                    } else {
+                      navigate('/home', { replace: true });
+                    }
+                  } else {
+                    setErrorMessage(err.message || 'Failed to authenticate with Google.');
+                  }
+                }
+              },
+            });
+
+            try {
+              window.google.accounts.id.prompt();
+            } catch (promptErr) {
+              console.warn('Google One-Tap prompt note:', promptErr);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Google SDK init notice:', err);
+      }
+    };
+
+    initGoogle();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [navigate, setUserAuth]);
+
+  const handleGoogleClick = () => {
+    setErrorMessage(null);
+    setGoogleError(null);
+    googleSignIn(async (user, token) => {
+      await setUserAuth(user, token);
+      if (shouldPromptProfileCompletion(user)) {
+        navigate('/complete-profile', { replace: true });
+      } else {
+        navigate('/home', { replace: true });
+      }
+    });
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage(null);
+    setResetSuccessMessage(null);
+
+    const inputVal = phone.trim();
+    const passVal = password.trim();
+
+    if (!inputVal) {
+      setErrorMessage('Please enter your username, email address, or phone number.');
+      return;
+    }
+
+    if (!passVal) {
+      setErrorMessage('Please enter your password.');
+      return;
+    }
+
+    setIsLoading(true);
+
+    const inputLower = inputVal.toLowerCase();
+
+    // Guard: Prevent SuperAdmin / Staff logins on the Patient App Login screen
+    if (
+      inputLower === 'superadmin' ||
+      inputLower.startsWith('superadmin@') ||
+      inputLower === 'sa101' ||
+      inputLower === 'sa'
+    ) {
+      setErrorMessage('SuperAdmin accounts cannot log in through the Patient App. Please use the SuperAdmin Console (/superadmin/login).');
+      setIsLoading(false);
+      return;
+    }
+
+    if (
+      inputLower === 'admin' ||
+      inputLower === 'admin@carepulse.com' ||
+      inputLower === 'bag' ||
+      inputLower === 'bag@carepulse.com' ||
+      inputLower === 'doc' ||
+      inputLower === 'doc@carepulse.com' ||
+      inputLower === 'doctor' ||
+      inputLower === 'rec' ||
+      inputLower === 'rec@carepulse.com' ||
+      inputLower === 'receptionist' ||
+      inputLower === 'nurse' ||
+      inputLower === 'nurse@carepulse.com'
+    ) {
+      setErrorMessage('Hospital staff and administrators cannot log in through the Patient App. Please use the Staff Portal (/staff/login).');
+      setIsLoading(false);
+      return;
+    }
+
+    const payload = {
+      username: inputVal,
+      email: inputVal,
+      phone: inputVal,
+      password: passVal,
+    };
+
+    let res: Response | null = null;
+    let data: any = {};
+
+    try {
+      res = await apiPost('/auth/login', payload);
+    } catch {
+      // All endpoints unreachable — fall through to local fallback below
+    }
+
+    if (res) {
+      data = await res.json().catch(() => ({}));
+
+      // 404 Not Found: Prompt user to Sign Up (Patient App only)
+      if (res.status === 404 || (data.detail && data.detail.toLowerCase().includes('not found'))) {
+        setUnregisteredIdentifier(inputVal);
+        setShowSignupPrompt(true);
+        setErrorMessage(`No patient account found for "${inputVal}". Click below to Sign Up.`);
+        setIsLoading(false);
+        return;
+      } else if (!res.ok) {
+        setErrorMessage(data.detail || data.error || 'Incorrect password or authentication error.');
+        setIsLoading(false);
+        return;
+      }
+
+      if (res.ok && data.user) {
+        await setUserAuth(data.user, data.token);
+        setIsLoading(false);
+        navigate('/home');
+        return;
+      }
+
+      // Fallback check: 1. Default Demo Patient (Sarah Jenkins) - only on explicit Sarah credentials
+      const isSarah =
+        inputLower === 'sarah' ||
+        inputLower === 'sarah jenkins' ||
+        inputLower === 'sarah.j@carepulse.com' ||
+        inputLower === 'sarah.jenkins@example.com' ||
+        inputVal === '+91 98765 43210' ||
+        inputVal.replace(/\D/g, '').slice(-10) === '9876543210';
+
+      if (
+        isSarah &&
+        (passVal === 'password123' ||
+          passVal === 'password' ||
+          passVal === 'Sarah@123' ||
+          passVal === '123456' ||
+          passVal === 'admin123')
+      ) {
+        const demoUser = {
+          id: 'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d',
+          fullName: 'Sarah Jenkins',
+          email: 'sarah.j@carepulse.com',
+          phone: '+91 98765 43210',
+          dob: '1995-07-24',
+          gender: 'Female',
+          bloodGroup: 'O+',
+          emergencyContact: { name: 'Emergency Contact', phone: '+1 555-0199', relationship: 'Primary' },
+          avatarUrl: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
+        };
+        await setUserAuth(demoUser, `demo-token-${Date.now()}`);
+        setIsLoading(false);
+        navigate('/home');
+        return;
+      }
+
+      // Fallback check: 2. Local registered users in storage
+      const storedUsersStr = localStorage.getItem('carepulse_registered_users');
+      const registeredUsers: any[] = storedUsersStr ? JSON.parse(storedUsersStr) : [];
+      const inputDigits = inputVal.replace(/\D/g, '').slice(-10);
+
+      const localMatched = registeredUsers.find((u) => {
+        const uName = (u.fullName || '').trim().toLowerCase();
+        const uDigits = (u.phone || '').replace(/\D/g, '').slice(-10);
+        const uEmail = (u.email || '').toLowerCase();
+        return (
+          (inputLower && uName && inputLower === uName) ||
+          (inputDigits && uDigits && inputDigits === uDigits) ||
+          (inputLower && uEmail && inputLower === uEmail)
+        );
+      });
+
+      if (localMatched) {
+        if (!localMatched.password || localMatched.password !== passVal) {
+          setErrorMessage('Incorrect password. Please verify your password and try again.');
+          setIsLoading(false);
+          return;
+        }
+        await setUserAuth(localMatched, `local-token-${Date.now()}`);
+        setIsLoading(false);
+        navigate('/home');
+        return;
+      } else {
+        setUnregisteredIdentifier(inputVal);
+        setShowSignupPrompt(true);
+        setErrorMessage(`No account found for "${inputVal}". Click below to Sign Up.`);
+      }
+    }
+
+    setIsLoading(false);
+  };
+
+  const handleProceedToSignup = () => {
+    setShowSignupPrompt(false);
+    const isEmail = unregisteredIdentifier.includes('@');
+    navigate('/register', {
+      state: isEmail ? { initialEmail: unregisteredIdentifier } : { initialPhone: unregisteredIdentifier },
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-white flex flex-col justify-center items-center px-4 py-8 sm:px-6 w-full relative">
+      <div className="w-full max-w-sm sm:max-w-md space-y-5">
+        {/* Brand Header */}
+        <div className="flex flex-col items-center text-center space-y-2">
+          <CarePulseLogo
+            variant="horizontal"
+            size="lg"
+            theme="light"
+            subtitle="Empathetic healthcare at your fingertips"
+          />
+        </div>
+
+        {/* Main Login Card */}
+        <Card padding="lg" className="shadow-xs border border-[#E4E7EC] bg-[#F8FAFC]/90 space-y-4">
+          <div className="text-left space-y-1 pb-1 border-b border-[#E4E7EC]/60">
+            <h2 className="text-base sm:text-lg font-bold font-heading text-[#111827]">{t('auth.loginTitle', 'Welcome Back')}</h2>
+            <p className="text-xs text-[#6B7280] leading-snug">{t('auth.loginSubtitle', 'Log in to manage appointments & health records')}</p>
+          </div>
+
+          {resetSuccessMessage && (
+            <div className="flex flex-col gap-2 p-3.5 rounded-xl bg-emerald-50 text-emerald-950 text-xs border border-emerald-300 shadow-2xs animate-fade-in text-left">
+              <div className="flex items-start gap-2">
+                <Activity className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <span className="leading-snug font-semibold">{resetSuccessMessage}</span>
+              </div>
+            </div>
+          )}
+
+          {/* User existence & error alert */}
+          {errorMessage && (
+            <div className="flex flex-col gap-2 p-3.5 rounded-xl bg-amber-50 text-amber-950 text-xs border border-amber-300 shadow-2xs animate-fade-in text-left">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <span className="leading-snug font-semibold">{errorMessage}</span>
+              </div>
+              {showSignupPrompt && (
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={handleProceedToSignup}
+                    className="w-full text-center text-xs font-bold text-white bg-[#0B5A54] hover:bg-[#094843] flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl shadow-2xs cursor-pointer transition-all"
+                  >
+                    <UserPlus className="w-4 h-4" />
+                    <span>Create Account / Sign Up Now →</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {/* Username / Email / Phone Input */}
+            <div className="space-y-1.5 text-left">
+              <Input
+                label={t('auth.emailOrPhone', 'USERNAME, EMAIL, OR PHONE')}
+                value={phone}
+                onChange={(e) => {
+                  setPhone(e.target.value);
+                  setShowSignupPrompt(false);
+                }}
+                placeholder={t('auth.emailOrPhone', 'Enter username, email, or phone number')}
+                leftIcon={<User className="w-4 h-4 text-[#0B5A54]" />}
+                required
+              />
+            </div>
+
+            {/* Password Input */}
+            <div className="space-y-1.5 text-left">
+              <div className="flex justify-between items-center">
+                <label className="block text-[10px] font-extrabold text-[#6B7280] uppercase tracking-wider">
+                  {t('auth.password', 'PASSWORD')}
+                </label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setErrorMessage(null);
+                    setResetSuccessMessage(null);
+                    setIsForgotPasswordOpen(true);
+                  }}
+                  className="text-[11px] font-bold text-[#0B5A54] hover:underline cursor-pointer"
+                >
+                  {t('auth.forgotPassword', 'Forgot Password?')}
+                </button>
+              </div>
+              <Input
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                isPassword
+                leftIcon={<Lock className="w-4 h-4 text-[#0B5A54]" />}
+                placeholder={t('auth.passwordPlaceholder', 'Enter password')}
+              />
+            </div>
+
+            {/* Submit Button */}
+            <Button
+              type="submit"
+              size="lg"
+              fullWidth
+              isLoading={isLoading}
+              rightIcon={<ArrowRight className="w-4 h-4" />}
+              className="mt-1 text-xs font-bold py-3 rounded-xl shadow-2xs"
+            >
+              {t('auth.loginButton', 'LOGIN')}
+            </Button>
+
+            {/* Divider */}
+            <div className="relative my-3 text-center">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-[#E4E7EC]" />
+              </div>
+              <span className="relative bg-[#F8FAFC] px-3 text-[10px] font-extrabold text-[#9CA3AF] uppercase tracking-wider">
+                {t('common.or', 'OR')}
+              </span>
+            </div>
+
+            <div className="w-full flex flex-col items-center justify-center">
+              <Button
+                type="button"
+                variant="outline"
+                fullWidth
+                isLoading={isGoogleLoading}
+                onClick={handleGoogleClick}
+                leftIcon={
+                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.24v3.13C3.26 21.35 7.37 24 12 24z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.6H1.24C.45 8.17 0 9.99 0 12s.45 3.83 1.24 5.4s3.28 3.13 5.28 3.13z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.37 0 3.26 2.65 1.24 6.6l4.04 3.13c.95-2.83 3.6-4.98 6.72-4.98z"
+                    />
+                  </svg>
+                }
+                className="font-bold text-xs text-[#111827] bg-white border border-[#E4E7EC] shadow-2xs py-2.5 rounded-xl hover:bg-gray-50 cursor-pointer"
+              >
+                {t('auth.googleLogin', 'Continue with Google')}
+              </Button>
+            </div>
+          </form>
+
+          {/* Cross-Portal Staff Link */}
+          <div className="pt-4 mt-4 border-t border-slate-100 flex flex-col items-center justify-center gap-1 text-center text-xs">
+            <p className="text-slate-500 font-medium">
+              Are you a receptionist, doctor, or admin?{' '}
+              <button
+                type="button"
+                onClick={() => navigate('/staff/login')}
+                className="font-bold text-[#0B5A54] hover:text-[#094843] hover:underline cursor-pointer transition-colors inline-flex items-center gap-0.5"
+              >
+                <span>Staff Portal</span>
+                <span aria-hidden="true">&rarr;</span>
+              </button>
+            </p>
+          </div>
+        </Card>
+
+        {/* Footer */}
+        <div className="text-center space-y-3 pt-1">
+          <p className="text-xs font-semibold text-[#6B7280]">
+            {t('auth.noAccount', 'New user?')}{' '}
+            <button
+              onClick={() => navigate('/register')}
+              className="font-bold text-[#0B5A54] hover:underline ml-0.5"
+            >
+              {t('auth.registerButton', 'Sign Up')}
+            </button>
+          </p>
+
+          <div className="flex justify-center items-center gap-1.5 pt-1">
+            <div className="w-6 h-1 rounded-full bg-[#0B5A54]" />
+            <div className="w-1.5 h-1.5 rounded-full bg-[#9CA3AF]/40" />
+            <div className="w-1.5 h-1.5 rounded-full bg-[#9CA3AF]/40" />
+          </div>
+        </div>
+      </div>
+
+      {/* Forgot Password Verification & Reset Modal */}
+      <ForgotPasswordModal
+        isOpen={isForgotPasswordOpen}
+        onClose={() => setIsForgotPasswordOpen(false)}
+        initialIdentifier={phone}
+        onSuccessReset={(loginId) => {
+          if (loginId) setPhone(loginId);
+          setPassword('');
+          setResetSuccessMessage('Your password was updated successfully! Please enter your new password to log in.');
+        }}
+      />
+    </div>
+  );
+};
